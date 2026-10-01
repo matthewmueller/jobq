@@ -5,18 +5,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/matthewmueller/jobq"
-	"golang.org/x/sync/errgroup"
+	"github.com/matthewmueller/jobq/internal/backoff"
 )
 
 type Payload = jobq.Payload
 type Job[T Payload] = jobq.Job[T]
 type Handler[T Payload] = jobq.Handler[T]
+type Stats = jobq.Stats
+
+// Permanent marks err as non-retryable, so the job fails immediately
+func Permanent(err error) error {
+	return jobq.Permanent(err)
+}
 
 // schema is idempotent. The advisory lock serializes concurrent Dials, since
 // CREATE ... IF NOT EXISTS can race across processes.
@@ -40,7 +50,7 @@ CREATE INDEX IF NOT EXISTS pgq_jobs_running ON pgq_jobs (queue, locked_until) WH
 `
 
 // Dial connects to PostgreSQL and creates the jobs table if needed
-func Dial(ctx context.Context, url string) (*Queues, error) {
+func Dial(ctx context.Context, log *slog.Logger, url string) (*Queues, error) {
 	pool, err := pgxpool.New(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("pgq: unable to connect: %w", err)
@@ -51,6 +61,7 @@ func Dial(ctx context.Context, url string) (*Queues, error) {
 	}
 	return &Queues{
 		pool:  pool,
+		log:   log.With("package", "pgq"),
 		lease: 30 * time.Second,
 		poll:  500 * time.Millisecond,
 	}, nil
@@ -59,6 +70,7 @@ func Dial(ctx context.Context, url string) (*Queues, error) {
 // Queues produces and consumes jobs backed by PostgreSQL
 type Queues struct {
 	pool    *pgxpool.Pool
+	log     *slog.Logger
 	lease   time.Duration // how long a claimed job is reserved before others may reclaim it
 	poll    time.Duration // how long an idle worker waits before checking for jobs again
 	configs []*Config
@@ -69,6 +81,7 @@ type Config struct {
 	queue       string
 	concurrency int
 	retries     int
+	timeout     time.Duration
 	handle      func(ctx context.Context, j *job) error
 }
 
@@ -82,6 +95,13 @@ func (c *Config) Concurrency(n int) *Config {
 // Retries sets how many times a failed job is retried. Defaults to 0.
 func (c *Config) Retries(n int) *Config {
 	c.retries = n
+	return c
+}
+
+// Timeout bounds how long a handler may run before its context is cancelled
+// and the attempt fails. Defaults to no timeout.
+func (c *Config) Timeout(d time.Duration) *Config {
+	c.timeout = d
 	return c
 }
 
@@ -103,7 +123,7 @@ func (q *Queues) Queue[T Payload](handler Handler[T]) *Config {
 		handle: func(ctx context.Context, j *job) error {
 			var data T
 			if err := json.Unmarshal(j.payload, &data); err != nil {
-				return fmt.Errorf("pgq: unable to decode job %d: %w", j.id, err)
+				return jobq.Permanent(fmt.Errorf("pgq: unable to decode job %d: %w", j.id, err))
 			}
 			return handler(ctx, &Job[T]{
 				ID:        strconv.FormatInt(j.id, 10),
@@ -119,6 +139,19 @@ func (q *Queues) Queue[T Payload](handler Handler[T]) *Config {
 
 // Push enqueues the payload onto the queue it names
 func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
+	return insert(ctx, q.pool, payload)
+}
+
+// PushTx enqueues the payload within tx, so the job only exists if tx commits
+func (q *Queues) PushTx[T Payload](ctx context.Context, tx pgx.Tx, payload T) error {
+	return insert(ctx, tx, payload)
+}
+
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func insert(ctx context.Context, db execer, payload Payload) error {
 	queue := payload.Queue()
 	if queue == "" {
 		return fmt.Errorf("pgq: %T has an empty queue name", payload)
@@ -127,25 +160,69 @@ func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
 	if err != nil {
 		return fmt.Errorf("pgq: unable to encode %q payload: %w", queue, err)
 	}
-	if _, err := q.pool.Exec(ctx, `INSERT INTO pgq_jobs (queue, payload) VALUES ($1, $2)`, queue, data); err != nil {
+	if _, err := db.Exec(ctx, `INSERT INTO pgq_jobs (queue, payload) VALUES ($1, $2)`, queue, data); err != nil {
 		return fmt.Errorf("pgq: unable to push to %q: %w", queue, err)
 	}
 	return nil
 }
 
+// Redrive moves the queue's failed jobs back to pending with fresh attempts
+func (q *Queues) Redrive(ctx context.Context, queue string) error {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE pgq_jobs SET state = 'pending', attempts = 0, run_at = now(), last_error = NULL, updated_at = now()
+		WHERE queue = $1 AND state = 'failed'
+	`, queue)
+	if err != nil {
+		return fmt.Errorf("pgq: unable to redrive %q: %w", queue, err)
+	}
+	q.log.Info("redrove failed jobs", "queue", queue, "count", tag.RowsAffected())
+	return nil
+}
+
+// Stats counts the queue's pending, running and failed jobs
+func (q *Queues) Stats(ctx context.Context, queue string) (*Stats, error) {
+	rows, err := q.pool.Query(ctx, `SELECT state, count(*) FROM pgq_jobs WHERE queue = $1 GROUP BY state`, queue)
+	if err != nil {
+		return nil, fmt.Errorf("pgq: unable to get stats for %q: %w", queue, err)
+	}
+	defer rows.Close()
+	stats := new(Stats)
+	for rows.Next() {
+		var state string
+		var count int
+		if err := rows.Scan(&state, &count); err != nil {
+			return nil, fmt.Errorf("pgq: unable to scan stats for %q: %w", queue, err)
+		}
+		switch state {
+		case "pending":
+			stats.Pending = count
+		case "running":
+			stats.Running = count
+		case "failed":
+			stats.Failed = count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgq: unable to get stats for %q: %w", queue, err)
+	}
+	return stats, nil
+}
+
 // Start processes jobs for all registered queues. It blocks until ctx is
-// cancelled and running handlers have returned.
+// cancelled and running handlers have returned. Database errors are logged
+// and retried rather than returned.
 func (q *Queues) Start(ctx context.Context) error {
 	if err := q.validate(); err != nil {
 		return err
 	}
-	eg, ctx := errgroup.WithContext(ctx)
+	var wg sync.WaitGroup
 	for _, config := range q.configs {
 		for range config.concurrency {
-			eg.Go(func() error { return q.work(ctx, config) })
+			wg.Go(func() { q.work(ctx, config) })
 		}
 	}
-	return eg.Wait()
+	wg.Wait()
+	return nil
 }
 
 // Close releases the database connections
@@ -167,6 +244,9 @@ func (q *Queues) validate() error {
 		if c.retries < 0 {
 			errs = append(errs, fmt.Errorf("pgq: %q retries must not be negative", c.queue))
 		}
+		if c.timeout < 0 {
+			errs = append(errs, fmt.Errorf("pgq: %q timeout must not be negative", c.queue))
+		}
 		if seen[c.queue] {
 			errs = append(errs, fmt.Errorf("pgq: %q is registered more than once", c.queue))
 		}
@@ -175,27 +255,38 @@ func (q *Queues) validate() error {
 	return errors.Join(errs...)
 }
 
-// work claims and runs jobs until ctx is cancelled
-func (q *Queues) work(ctx context.Context, c *Config) error {
-	for {
+// work claims and runs jobs until ctx is cancelled. Database errors back off
+// and retry so a blip doesn't stop the worker.
+func (q *Queues) work(ctx context.Context, c *Config) {
+	failures := 0
+	for ctx.Err() == nil {
 		j, err := q.claim(ctx, c)
+		if err == nil && j != nil {
+			err = q.run(ctx, c, j)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return
 			}
-			return err
-		}
-		if j == nil {
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(q.poll):
-			}
+			failures++
+			q.log.Error("worker error", "queue", c.queue, "error", err)
+			sleep(ctx, min(backoff.Delay(failures), 30*time.Second))
 			continue
 		}
-		if err := q.run(ctx, c, j); err != nil {
-			return err
+		failures = 0
+		if j == nil {
+			sleep(ctx, q.poll)
 		}
+	}
+}
+
+// sleep waits for d or until ctx is cancelled
+func sleep(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
 	}
 }
 
@@ -238,18 +329,25 @@ func (q *Queues) run(ctx context.Context, c *Config, j *job) error {
 		return q.finish(ctx, c, j, errors.New("pgq: lease expired"))
 	}
 	stop := q.heartbeat(ctx, j)
-	err := call(ctx, c, j)
+	err := q.call(ctx, c, j)
 	stop()
 	return q.finish(ctx, c, j, err)
 }
 
-// call invokes the handler, converting panics into errors
-func call(ctx context.Context, c *Config, j *job) (err error) {
+// call invokes the handler with the configured timeout, converting panics
+// into errors
+func (q *Queues) call(ctx context.Context, c *Config, j *job) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			q.log.Error("handler panicked", "queue", c.queue, "job", j.id, "panic", r, "stack", string(debug.Stack()))
 			err = fmt.Errorf("pgq: handler panicked: %v", r)
 		}
 	}()
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
 	return c.handle(ctx, j)
 }
 
@@ -267,10 +365,12 @@ func (q *Queues) heartbeat(ctx context.Context, j *job) (stop func()) {
 				return
 			case <-ticker.C:
 				// Errors are retried on the next tick, well before the lease expires
-				q.pool.Exec(ctx, `
+				if _, err := q.pool.Exec(ctx, `
 					UPDATE pgq_jobs SET locked_until = now() + $3 * interval '1 millisecond', updated_at = now()
 					WHERE id = $1 AND attempts = $2 AND state = 'running'
-				`, j.id, j.attempt, q.lease.Milliseconds())
+				`, j.id, j.attempt, q.lease.Milliseconds()); err != nil && ctx.Err() == nil {
+					q.log.Warn("unable to extend lease", "job", j.id, "error", err)
+				}
 			}
 		}
 	}()
@@ -287,12 +387,16 @@ func (q *Queues) finish(ctx context.Context, c *Config, j *job, err error) error
 	shutdown := ctx.Err() != nil
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
+	log := q.log.With("queue", c.queue, "job", j.id, "attempt", j.attempt)
 	switch {
 	case err == nil:
 		return q.update(ctx, j, `
 			UPDATE pgq_jobs SET state = 'completed', locked_until = NULL, updated_at = now()
 			WHERE id = $1 AND attempts = $2 AND state = 'running'
 		`)
+	case jobq.IsPermanent(err):
+		// Honored even during shutdown, since it should never be retried
+		return q.fail(ctx, log, j, err)
 	case shutdown:
 		// Interrupted by shutdown, so release the job without using up an attempt
 		return q.update(ctx, j, `
@@ -300,6 +404,8 @@ func (q *Queues) finish(ctx context.Context, c *Config, j *job, err error) error
 			WHERE id = $1 AND attempts = $2 AND state = 'running'
 		`)
 	case j.attempt <= c.retries:
+		delay := backoff.Delay(j.attempt)
+		log.Warn("job failed, retrying", "error", err, "delay", delay)
 		return q.update(ctx, j, `
 			UPDATE pgq_jobs SET
 				state = 'pending',
@@ -308,13 +414,19 @@ func (q *Queues) finish(ctx context.Context, c *Config, j *job, err error) error
 				locked_until = NULL,
 				updated_at = now()
 			WHERE id = $1 AND attempts = $2 AND state = 'running'
-		`, err.Error(), backoff(j.attempt).Milliseconds())
+		`, err.Error(), delay.Milliseconds())
 	default:
-		return q.update(ctx, j, `
-			UPDATE pgq_jobs SET state = 'failed', last_error = $3, locked_until = NULL, updated_at = now()
-			WHERE id = $1 AND attempts = $2 AND state = 'running'
-		`, err.Error())
+		return q.fail(ctx, log, j, err)
 	}
+}
+
+// fail permanently fails the job, leaving it in the dead-letter state
+func (q *Queues) fail(ctx context.Context, log *slog.Logger, j *job, err error) error {
+	log.Error("job failed", "error", err, "permanent", jobq.IsPermanent(err))
+	return q.update(ctx, j, `
+		UPDATE pgq_jobs SET state = 'failed', last_error = $3, locked_until = NULL, updated_at = now()
+		WHERE id = $1 AND attempts = $2 AND state = 'running'
+	`, err.Error())
 }
 
 func (q *Queues) update(ctx context.Context, j *job, sql string, args ...any) error {
@@ -322,9 +434,4 @@ func (q *Queues) update(ctx context.Context, j *job, sql string, args ...any) er
 		return fmt.Errorf("pgq: unable to update job %d: %w", j.id, err)
 	}
 	return nil
-}
-
-// backoff returns how long to wait before retrying a failed attempt
-func backoff(attempt int) time.Duration {
-	return 0
 }

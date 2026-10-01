@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,10 +23,15 @@ func databaseURL() string {
 	return "postgres://localhost:5432/jobq_test?sslmode=disable"
 }
 
+// logger writes to the test's output, shown for failed or verbose tests
+func logger(t testing.TB) *slog.Logger {
+	return slog.New(slog.NewTextHandler(t.Output(), nil))
+}
+
 // dial connects a Queues, skipping the test if the database is unavailable
 func dial(t testing.TB) *pgq.Queues {
 	t.Helper()
-	queues, err := pgq.Dial(context.Background(), databaseURL())
+	queues, err := pgq.Dial(context.Background(), logger(t), databaseURL())
 	if err != nil {
 		t.Skipf("unable to dial %s: %v", databaseURL(), err)
 	}
@@ -189,6 +196,22 @@ func TestPushWithoutRegistration(t *testing.T) {
 	job := receive(t, u.jobs)
 	is.Equal(job.Data.Name, "bob")
 	waitFor(t, db, "test.create_user", "completed", 1)
+	stop()
+}
+
+func TestPushPointer(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	db := database(t)
+	u := &users{jobs: make(chan *pgq.Job[createUser], 2)}
+	queues.Queue(u.Create)
+	is.NoErr(queues.Push(ctx, &createUser{Name: "dave"}))
+	is.NoErr(queues.Push(ctx, createUser{Name: "erin"}))
+	stop := start(t, queues)
+	is.Equal(receive(t, u.jobs).Data.Name, "dave")
+	is.Equal(receive(t, u.jobs).Data.Name, "erin")
+	waitFor(t, db, "test.create_user", "completed", 2)
 	stop()
 }
 
@@ -398,12 +421,167 @@ func TestInvalidConfig(t *testing.T) {
 	queues := dial(t)
 	w := &worker{started: make(chan struct{})}
 	queues.Queue(w.Run).Concurrency(0)
-	queues.Queue(w.Run).Retries(-1)
+	queues.Queue(w.Run).Retries(-1).Timeout(-time.Second)
 	err := queues.Start(context.Background())
 	is.True(err != nil)
 	is.Equal(err.Error(), `pgq: "test.long_task" concurrency must be at least 1
 pgq: "test.long_task" retries must not be negative
+pgq: "test.long_task" timeout must not be negative
 pgq: "test.long_task" is registered more than once`)
+}
+
+type importFile struct {
+	Path string
+}
+
+func (importFile) Queue() string { return "test.import_file" }
+
+type importer struct {
+	attempts chan int
+}
+
+func (i *importer) Import(ctx context.Context, job *pgq.Job[importFile]) error {
+	i.attempts <- job.Attempt
+	return pgq.Permanent(errors.New("unsupported format"))
+}
+
+func TestPermanent(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	db := database(t)
+	i := &importer{attempts: make(chan int, 10)}
+	queues.Queue(i.Import).Retries(3)
+	is.NoErr(queues.Push(ctx, importFile{Path: "a.xls"}))
+	stop := start(t, queues)
+	rows := waitFor(t, db, "test.import_file", "failed", 1)
+	stop()
+	is.Equal(rows[0].Attempts, 1) // not retried
+	is.Equal(*rows[0].LastError, "unsupported format")
+	is.Equal(len(i.attempts), 1)
+}
+
+func TestDecodeError(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	db := database(t)
+	u := &users{jobs: make(chan *pgq.Job[createUser], 1)}
+	queues.Queue(u.Create).Retries(3)
+	_, err := db.Exec(ctx, `INSERT INTO pgq_jobs (queue, payload) VALUES ('test.create_user', '"not an object"')`)
+	is.NoErr(err)
+	stop := start(t, queues)
+	rows := waitFor(t, db, "test.create_user", "failed", 1)
+	stop()
+	is.Equal(rows[0].Attempts, 1) // not retried
+	is.True(strings.Contains(*rows[0].LastError, "unable to decode"))
+	is.Equal(len(u.jobs), 0)
+}
+
+type slowTask struct{}
+
+func (slowTask) Queue() string { return "test.slow_task" }
+
+type sleeper struct {
+	errs chan error
+}
+
+func (s *sleeper) Run(ctx context.Context, job *pgq.Job[slowTask]) error {
+	<-ctx.Done()
+	s.errs <- ctx.Err()
+	return ctx.Err()
+}
+
+func TestTimeout(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	db := database(t)
+	s := &sleeper{errs: make(chan error, 1)}
+	queues.Queue(s.Run).Timeout(50 * time.Millisecond)
+	is.NoErr(queues.Push(ctx, slowTask{}))
+	stop := start(t, queues)
+	is.Equal(receive(t, s.errs), context.DeadlineExceeded)
+	rows := waitFor(t, db, "test.slow_task", "failed", 1)
+	stop()
+	is.Equal(*rows[0].LastError, "context deadline exceeded")
+}
+
+func TestPushTx(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	db := database(t)
+	// Rolled back, so never enqueued
+	tx, err := db.Begin(ctx)
+	is.NoErr(err)
+	is.NoErr(queues.PushTx(ctx, tx, createUser{Name: "mallory"}))
+	is.NoErr(tx.Rollback(ctx))
+	// Committed
+	tx, err = db.Begin(ctx)
+	is.NoErr(err)
+	is.NoErr(queues.PushTx(ctx, tx, createUser{Name: "carol"}))
+	is.NoErr(tx.Commit(ctx))
+	u := &users{jobs: make(chan *pgq.Job[createUser], 2)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	job := receive(t, u.jobs)
+	is.Equal(job.Data.Name, "carol")
+	waitFor(t, db, "test.create_user", "completed", 1)
+	stop()
+}
+
+type flaky struct {
+	mu    sync.Mutex
+	calls int
+	done  chan int
+}
+
+// Send fails the first call and succeeds afterwards
+func (f *flaky) Send(ctx context.Context, job *pgq.Job[sendEmail]) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.calls == 1 {
+		return errors.New("smtp unavailable")
+	}
+	f.done <- job.Attempt
+	return nil
+}
+
+func TestRedrive(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	db := database(t)
+	f := &flaky{done: make(chan int, 1)}
+	queues.Queue(f.Send)
+	is.NoErr(queues.Push(ctx, sendEmail{To: "a@example.com"}))
+	stop := start(t, queues)
+	waitFor(t, db, "test.send_email", "failed", 1)
+	stats, err := queues.Stats(ctx, "test.send_email")
+	is.NoErr(err)
+	is.Equal(stats.Failed, 1)
+	is.NoErr(queues.Redrive(ctx, "test.send_email"))
+	is.Equal(receive(t, f.done), 1) // attempts start over
+	rows := waitFor(t, db, "test.send_email", "completed", 1)
+	stop()
+	is.Equal(rows[0].LastError, nil)
+}
+
+func TestStats(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	database(t)
+	is.NoErr(queues.Push(ctx, createUser{Name: "alice"}))
+	is.NoErr(queues.Push(ctx, createUser{Name: "bob"}))
+	stats, err := queues.Stats(ctx, "test.create_user")
+	is.NoErr(err)
+	is.Equal(stats, &pgq.Stats{Pending: 2})
+	stats, err = queues.Stats(ctx, "test.unknown")
+	is.NoErr(err)
+	is.Equal(stats, &pgq.Stats{})
 }
 
 type RunSession struct {
@@ -437,7 +615,7 @@ func (s *session) Interrupt(ctx context.Context, job *pgq.Job[InterruptSession])
 func Example() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	queues, err := pgq.Dial(ctx, databaseURL())
+	queues, err := pgq.Dial(ctx, slog.Default(), databaseURL())
 	if err != nil {
 		panic(err)
 	}
@@ -468,7 +646,7 @@ func ExampleQueues_Push() {
 	defer cancel()
 
 	// A producer pushes jobs without registering any handlers
-	producer, err := pgq.Dial(ctx, databaseURL())
+	producer, err := pgq.Dial(ctx, slog.Default(), databaseURL())
 	if err != nil {
 		panic(err)
 	}
@@ -478,7 +656,7 @@ func ExampleQueues_Push() {
 	}
 
 	// A consumer, typically another process, handles them
-	consumer, err := pgq.Dial(ctx, databaseURL())
+	consumer, err := pgq.Dial(ctx, slog.Default(), databaseURL())
 	if err != nil {
 		panic(err)
 	}
@@ -514,7 +692,7 @@ func (w *welcome) Send(ctx context.Context, job *pgq.Job[SendWelcome]) error {
 func ExampleConfig_Retries() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	queues, err := pgq.Dial(ctx, databaseURL())
+	queues, err := pgq.Dial(ctx, slog.Default(), databaseURL())
 	if err != nil {
 		panic(err)
 	}
