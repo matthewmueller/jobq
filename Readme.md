@@ -1,16 +1,13 @@
 # jobq
 
-Typed background job queues for Go, backed by PostgreSQL (`pgq`), SQLite (`sqq`), NATS JetStream (`jetq`) or Amazon SQS (`sqs`). Payload types name their own queue and handlers are plain typed methods, so producers and consumers can't disagree about queue names or payload shapes.
+Typed background job queues for Go, backed by PostgreSQL, SQLite, NATS JetStream or Amazon SQS. Payload types name their own queue and handlers are plain typed methods, so producers and consumers can't disagree about queue names or payloads.
 
 ## Features
 
-- Payload types are inferred from handler signatures: `queues.Queue(session.Run)`
+- Payload types are inferred from handlers: `queues.Queue(session.Run)`
 - Push from any process without registering handlers: `queues.Push(ctx, RunSession{...})`
-- Per-queue concurrency, retries with exponential backoff, and handler timeouts
+- Per-queue concurrency, retries with backoff, and timeouts
 - Dead-letter queues with `Revive` and `Stats`
-- `Permanent(err)` to skip retries for errors that will never succeed
-- Transactional push for PostgreSQL and SQLite with `PushTx`
-- Safe across processes: `FOR UPDATE SKIP LOCKED` leases in PostgreSQL, single-writer claims in SQLite, acknowledgements in JetStream, visibility timeouts in SQS
 
 ## Install
 
@@ -18,7 +15,7 @@ Typed background job queues for Go, backed by PostgreSQL (`pgq`), SQLite (`sqq`)
 go get github.com/matthewmueller/jobq
 ```
 
-Requires Go 1.27 or later for generic methods.
+Requires Go 1.27 or later.
 
 ## Example
 
@@ -33,16 +30,33 @@ import (
 	"github.com/matthewmueller/jobq/pgq"
 )
 
-// RunSession is the contract between producers and consumers
-type RunSession struct {
+// Session queues
+type Session struct{
+  // Dependencies
+}
+
+type Run struct {
 	SessionID string
 }
 
-func (RunSession) Queue() string { return "session-run" }
+func (Run) Queue() string {
+  return "session.run"
+}
 
-type session struct{}
+func (s *Session) Run(ctx context.Context, job *pgq.Job[RunSession]) error {
+	// job.Data.SessionID, job.ID, job.Attempt
+	return nil
+}
 
-func (s *session) Run(ctx context.Context, job *pgq.Job[RunSession]) error {
+type Interrupt struct {
+	SessionID string
+}
+
+func (Interrupt) Queue() string {
+  return "session.interrupt"
+}
+
+func (s *Session) Interrupt(ctx context.Context, job *pgq.Job[Interrupt]) error {
 	// job.Data.SessionID, job.ID, job.Attempt
 	return nil
 }
@@ -55,14 +69,15 @@ func main() {
 	}
 	defer queues.Close()
 
-	// Configure consumers
-	session := &session{}
-	queues.Queue(session.Run).
-		Concurrency(4).
-		Retries(3).
-		Timeout(time.Minute)
+  {
+    session := &Session{}
+    // Configure "session.run" queue
+    queues.Queue(session.Run).Concurrency(4).Retries(3).Timeout(time.Minute)
+    // Configure "session.interrupt" queue
+    queues.Queue(session.Interrupt).Concurrency(4).Retries(3).Timeout(time.Minute)
+  }
 
-	// Produce from anywhere with *pgq.Queues
+  // Push some work onto the "session.run" queue
 	if err := queues.Push(ctx, RunSession{SessionID: "123"}); err != nil {
 		panic(err)
 	}
@@ -74,97 +89,40 @@ func main() {
 }
 ```
 
-Switching to SQLite changes the import and `Dial`; the rest of the API is identical:
+## Backends
 
-```go
-queues, err := sqq.Dial(ctx, slog.Default(), "jobs.db")
-```
+Every backend has the same API. Switching changes the import and `Dial`:
 
-Switching to NATS JetStream works the same way. `Dial` creates the streams it needs:
-
-```go
-queues, err := jetq.Dial(ctx, slog.Default(), "nats://localhost:4222")
-```
-
-Switching to SQS also changes the import and `Dial`. Retries come from the queue's redrive policy instead of `.Retries(n)`:
-
-```go
-queues, err := sqs.Dial(ctx, slog.Default(), "https://sqs.us-west-2.amazonaws.com/123456789012")
-queues.Queue(session.Run).Concurrency(4).Timeout(time.Minute)
-```
+| Package | Dial                                                                 | Notes                                                                 |
+| ------- | -------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `pgq`   | `pgq.Dial(ctx, log, "postgres://localhost/app")`                     | Creates `pgq_jobs`. Wakes workers with LISTEN/NOTIFY. PostgreSQL 14+. |
+| `sqq`   | `sqq.Dial(ctx, log, "jobs.db")`                                      | Creates `sqq_jobs`. Processes must share one host. No `:memory:`.     |
+| `jetq`  | `jetq.Dial(ctx, log, "nats://localhost:4222")`                       | Creates the `JOBQ` and `JOBQ_DEAD` streams and a consumer per queue.  |
+| `sqs`   | `sqs.Dial(ctx, log, "https://sqs.<region>.amazonaws.com/<account>")` | Queues and dead-letter queues must already exist.                     |
 
 ## API Reference
 
-All backends share this API:
+| Method                            | Description                                         |
+| --------------------------------- | --------------------------------------------------- |
+| `queues.Queue(handler)`           | Register a handler for its payload's queue          |
+| `config.Concurrency(n)`           | Jobs this process runs at once (default 1)          |
+| `config.Retries(n)`               | Retries after a failure (default 0). Not on `sqs`.  |
+| `config.Timeout(d)`               | Cancel the handler after `d` (default none)         |
+| `queues.Push(ctx, payload)`       | Enqueue onto `payload.Queue()`                      |
+| `queues.PushTx(ctx, tx, payload)` | Enqueue inside a transaction (`pgq` and `sqq` only) |
+| `queues.Start(ctx)`               | Process registered queues until `ctx` is cancelled  |
+| `queues.Revive(ctx, queue)`       | Move dead-lettered jobs back onto the queue         |
+| `queues.Stats(ctx, queue)`        | Pending, running and failed counts                  |
+| `Permanent(err)`                  | Fail without retrying                               |
 
-| Method | Description |
-| --- | --- |
-| `Dial(ctx, log, url)` | Connect. `pgq` and `sqq` create their jobs table and `jetq` its streams if needed. |
-| `queues.Queue(handler)` | Register a handler, returning a `*Config` |
-| `config.Concurrency(n)` | Jobs this process runs at once for the queue (default 1) |
-| `config.Timeout(d)` | Cancel the handler's context after `d` and fail the attempt (default none) |
-| `queues.Push(ctx, payload)` | Enqueue onto `payload.Queue()` |
-| `queues.Start(ctx)` | Process registered queues until `ctx` is cancelled |
-| `queues.Revive(ctx, queue)` | Move dead-lettered jobs back onto the queue |
-| `queues.Stats(ctx, queue)` | Pending, running and failed (dead-lettered) counts |
-| `Permanent(err)` | Mark an error as non-retryable |
-| `jobq.IsPermanent(err)` | Report whether an error was marked with `Permanent` |
+Jobs are delivered **at least once**, so make handlers idempotent. Returning an error retries the job after 1s, 2s, 4s… up to 15 minutes. Once retries run out, or the error is `Permanent`, the job is dead-lettered.
 
-Backend specific:
+### Backend notes
 
-| Method | Description |
-| --- | --- |
-| `pgq`, `sqq`, `jetq` `config.Retries(n)` | Retry failed jobs `n` times (default 0) |
-| `pgq` `queues.PushTx(ctx, tx, payload)` | Enqueue inside a `pgx.Tx`, so the job only exists if `tx` commits |
-| `sqq` `queues.PushTx(ctx, tx, payload)` | Enqueue inside a `*sql.Tx`, so the job only exists if `tx` commits |
-
-### Delivery semantics
-
-All backends deliver **at least once**. A job can run again if a worker crashes, loses its lease, or the process shuts down mid-job, so make handlers idempotent. `Job.ID` is stable across retries.
-
-Returning `nil` completes a job. Returning an error retries it after a backoff of 1s, 2s, 4s… up to 15 minutes. Once retries are exhausted, or the error is `Permanent`, the job is dead-lettered.
-
-### PostgreSQL
-
-- Failed jobs stay in `pgq_jobs` with `state = 'failed'` and `last_error`. `Revive` resets them to pending with fresh attempts.
-- Completed jobs are kept with `state = 'completed'`. Delete them periodically, e.g. `DELETE FROM pgq_jobs WHERE state = 'completed' AND updated_at < now() - interval '7 days'`.
-- Workers share the connection pool. Size it for the total concurrency with `pool_max_conns` in the URL, e.g. `postgres://…/app?pool_max_conns=20`.
-- Idle workers are woken by LISTEN/NOTIFY: a `pgq_jobs_notify` trigger notifies whenever a job becomes pending, on commit. Polling every 5s remains as a fallback. Requires PostgreSQL 14 or later.
-- Each `Queues` with registered handlers holds one extra connection, outside the pool, for `LISTEN`. It needs a direct or session-pooled connection, because PgBouncer's transaction pooling doesn't support `LISTEN`.
-
-### SQLite
-
-- `Dial` takes a file path or `file:` URI and enables WAL mode, a 5 second busy timeout and immediate transactions. In-memory databases are rejected, since each pooled connection would get its own database.
-- Processes sharing a database must run on the same host, and the file must not be on a network filesystem.
-- SQLite has no LISTEN/NOTIFY, so idle workers poll every 500ms. `Push` and `Revive` wake idle workers in the same process immediately, while other processes and `PushTx` jobs wait for the next poll.
-- SQLite runs one writer at a time, so claims serialize. That's plenty for most job volumes, but use `pgq` for high write throughput.
-- For `PushTx`, open your own `*sql.DB` with `?_pragma=busy_timeout(5000)&_txlock=immediate` so transactions wait for the write lock instead of failing.
-- Failed and completed jobs stay in `sqq_jobs`, as with PostgreSQL. Times are Unix milliseconds, e.g. `DELETE FROM sqq_jobs WHERE state = 'completed' AND updated_at < unixepoch('now', '-7 days') * 1000`.
-
-### NATS JetStream
-
-- `Dial` creates or updates two streams with work-queue retention, so each message is deleted once it's acknowledged. `JOBQ` holds jobs on `jobq.jobs.<queue>`, and `JOBQ_DEAD` holds dead-lettered jobs on `jobq.dead.<queue>`.
-- `Start` creates a durable pull consumer per registered queue, named after the queue with dots replaced by underscores (`session.run` becomes `session_run`). Queue names are dot-separated tokens of letters, numbers, hyphens and underscores.
-- The connection needs permission to publish to `jobq.>` and to manage those streams and consumers.
-- Attempts are JetStream deliveries, so a delivery interrupted by a shutdown or crash uses up an attempt. A job that crashes the whole process (a panic in a handler is recovered and doesn't) is redelivered indefinitely.
-- Dead-lettered jobs carry `Jobq-Error` and `Jobq-Attempts` headers. Inspect them with `nats stream view JOBQ_DEAD`.
-
-### SQS
-
-Each payload's queue lives at `<url>/<Payload.Queue()>` and must already exist. Queue names may only contain letters, numbers, hyphens and underscores. For each queue:
-
-1. Create the queue and a dead-letter queue, e.g. `session-run` and `session-run-dlq`.
-2. Set a redrive policy on the queue pointing at the dead-letter queue. `maxReceiveCount` is the total number of attempts.
-3. Grant the application:
-   - On the queue: `sqs:SendMessage`, `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`, `sqs:GetQueueAttributes`, `sqs:StartMessageMoveTask`
-   - On the dead-letter queue: `sqs:SendMessage`, `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`
-
-`Start` fails if a queue doesn't exist, and warns if it has no redrive policy, since failed jobs would then retry until they expire.
-
-### Alarms
-
-- Dead-letter depth above zero: `Stats(...).Failed`, or CloudWatch `ApproximateNumberOfMessagesVisible` on the SQS dead-letter queue.
-- Age of the oldest pending job: CloudWatch `ApproximateAgeOfOldestMessage` for SQS, or the oldest `run_at` over pending rows for PostgreSQL and SQLite.
+- **PostgreSQL:** completed jobs stay in `pgq_jobs`, so delete them periodically. `LISTEN` uses one extra connection per process running workers, which must be direct or session-pooled (PgBouncer's transaction pooling doesn't support it).
+- **SQLite:** other processes find new jobs by polling every 500ms. Don't put the file on a network filesystem.
+- **NATS JetStream:** queue names are dot-separated tokens. A delivery interrupted by a shutdown or crash counts as an attempt.
+- **SQS:** queue names may only use letters, numbers, hyphens and underscores. Retries come from each queue's redrive policy, where `maxReceiveCount` is the total number of attempts. The app needs `SendMessage`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`, `GetQueueAttributes` and `StartMessageMoveTask` on its queues, and `SendMessage`, `ReceiveMessage`, `DeleteMessage` and `GetQueueAttributes` on the dead-letter queues.
 
 ## Development
 
@@ -172,4 +130,4 @@ Each payload's queue lives at `<url>/<Payload.Queue()>` and must already exist. 
 make test
 ```
 
-`sqq` tests use temporary files and `jetq` tests run an embedded NATS server, so neither needs setup. `pgq` tests use `DATABASE_URL`, defaulting to `postgres://localhost:5432/jobq_test`. `sqs` tests use `SQS_QUEUE`, the URL of a dedicated test queue, and are skipped when it's unset. The dead-letter tests also need a redrive policy on that queue.
+`sqq` and `jetq` tests need no setup. `pgq` tests use `DATABASE_URL` (default `postgres://localhost:5432/jobq_test`). `sqs` tests use `SQS_QUEUE` and skip when it's unset.
