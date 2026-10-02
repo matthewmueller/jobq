@@ -553,7 +553,7 @@ func TestPermanent(t *testing.T) {
 	is.Equal(aws.ToString(msgs[0].Body), `{"Path":"a.xls"}`)
 }
 
-func TestRedrive(t *testing.T) {
+func TestRevive(t *testing.T) {
 	is := is.New(t)
 	ctx := context.Background()
 	queues := dial(t)
@@ -566,10 +566,10 @@ func TestRedrive(t *testing.T) {
 	is.Equal(receive(t, i.done), 1)
 	// A move task only moves the messages SQS counts when it starts. Counts
 	// are approximate and lag, so a message dead-lettered moments ago can be
-	// missed. Retry the redrive until the message comes back.
+	// missed. Keep reviving until the message comes back.
 	arrived(t, client, dlq)
 	for attempt := 1; ; attempt++ {
-		if err := queues.Redrive(ctx, testQueue()); err != nil {
+		if err := queues.Revive(ctx, testQueue()); err != nil {
 			t.Log(err) // e.g. the previous move task is still running
 		}
 		select {
@@ -579,7 +579,7 @@ func TestRedrive(t *testing.T) {
 			if attempt < 8 {
 				continue
 			}
-			t.Fatal("timed out waiting for the redriven message")
+			t.Fatal("timed out waiting for the revived message")
 		}
 		break
 	}

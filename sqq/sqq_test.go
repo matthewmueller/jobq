@@ -1,26 +1,25 @@
-package pgq_test
+package sqq_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/matryer/is"
-	"github.com/matthewmueller/jobq/pgq"
+	"github.com/matthewmueller/jobq/sqq"
 )
 
-func databaseURL() string {
-	if url := os.Getenv("DATABASE_URL"); url != "" {
-		return url
-	}
-	return "postgres://localhost:5432/jobq_test?sslmode=disable"
+// file returns a fresh database path for the test
+func file(t testing.TB) string {
+	return filepath.Join(t.TempDir(), "jobs.db")
 }
 
 // logger writes to the test's output, shown for failed or verbose tests
@@ -28,34 +27,31 @@ func logger(t testing.TB) *slog.Logger {
 	return slog.New(slog.NewTextHandler(t.Output(), nil))
 }
 
-// dial connects a Queues, skipping the test if the database is unavailable
-func dial(t testing.TB) *pgq.Queues {
+// dial opens a Queues on the database at path
+func dial(t testing.TB, path string) *sqq.Queues {
 	t.Helper()
-	queues, err := pgq.Dial(context.Background(), logger(t), databaseURL())
+	queues, err := sqq.Dial(context.Background(), logger(t), path)
 	if err != nil {
-		t.Skipf("unable to dial %s: %v", databaseURL(), err)
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { queues.Close() })
 	return queues
 }
 
-// database returns a raw connection for inspecting jobs and clears the table.
-// Call after dial so the table exists.
-func database(t testing.TB) *pgxpool.Pool {
+// database returns a raw connection for inspecting jobs. Call after dial so
+// the table exists.
+func database(t testing.TB, path string) *sql.DB {
 	t.Helper()
-	db, err := pgxpool.New(context.Background(), databaseURL())
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(db.Close)
-	if _, err := db.Exec(context.Background(), `TRUNCATE pgq_jobs`); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() { db.Close() })
 	return db
 }
 
 // start runs the queues in the background. Calling stop cancels and waits.
-func start(t testing.TB, queues *pgq.Queues) (stop func()) {
+func start(t testing.TB, queues *sqq.Queues) (stop func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
@@ -96,7 +92,7 @@ type row struct {
 }
 
 // waitFor polls until the queue has count jobs, all in the given state
-func waitFor(t testing.TB, db *pgxpool.Pool, queue, state string, count int) []row {
+func waitFor(t testing.TB, db *sql.DB, queue, state string, count int) []row {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -117,9 +113,9 @@ func waitFor(t testing.TB, db *pgxpool.Pool, queue, state string, count int) []r
 	}
 }
 
-func jobs(t testing.TB, db *pgxpool.Pool, queue string) []row {
+func jobs(t testing.TB, db *sql.DB, queue string) []row {
 	t.Helper()
-	rs, err := db.Query(context.Background(), `SELECT state, attempts, last_error FROM pgq_jobs WHERE queue = $1 ORDER BY id`, queue)
+	rs, err := db.QueryContext(context.Background(), `SELECT state, attempts, last_error FROM sqq_jobs WHERE queue = ? ORDER BY id`, queue)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,12 +135,13 @@ func jobs(t testing.TB, db *pgxpool.Pool, queue string) []row {
 }
 
 // crashed inserts a job that looks like its worker died mid-run
-func crashed(t testing.TB, db *pgxpool.Pool, payload pgq.Payload, attempts int) {
+func crashed(t testing.TB, db *sql.DB, payload sqq.Payload, attempts int) {
 	t.Helper()
-	_, err := db.Exec(context.Background(), `
-		INSERT INTO pgq_jobs (queue, payload, state, attempts, locked_until)
-		VALUES ($1, '{}', 'running', $2, now() - interval '1 second')
-	`, payload.Queue(), attempts)
+	now := time.Now().UnixMilli()
+	_, err := db.ExecContext(context.Background(), `
+		INSERT INTO sqq_jobs (queue, payload, state, attempts, locked_until, run_at, created_at, updated_at)
+		VALUES (?1, '{}', 'running', ?2, ?3, ?4, ?4, ?4)
+	`, payload.Queue(), attempts, now-1000, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,20 +154,21 @@ type createUser struct {
 func (createUser) Queue() string { return "test.create_user" }
 
 type users struct {
-	jobs chan *pgq.Job[createUser]
+	jobs chan *sqq.Job[createUser]
 }
 
-func (u *users) Create(ctx context.Context, job *pgq.Job[createUser]) error {
+func (u *users) Create(ctx context.Context, job *sqq.Job[createUser]) error {
 	u.jobs <- job
 	return nil
 }
 
 func TestPushAndProcess(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
-	u := &users{jobs: make(chan *pgq.Job[createUser], 1)}
+	queues := dial(t, path)
+	db := database(t, path)
+	u := &users{jobs: make(chan *sqq.Job[createUser], 1)}
 	queues.Queue(u.Create)
 	is.NoErr(queues.Push(ctx, createUser{Name: "alice"}))
 	stop := start(t, queues)
@@ -185,12 +183,13 @@ func TestPushAndProcess(t *testing.T) {
 
 func TestPushWithoutRegistration(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	producer := dial(t)
-	consumer := dial(t)
-	db := database(t)
+	producer := dial(t, path)
+	consumer := dial(t, path)
+	db := database(t, path)
 	is.NoErr(producer.Push(ctx, createUser{Name: "bob"}))
-	u := &users{jobs: make(chan *pgq.Job[createUser], 1)}
+	u := &users{jobs: make(chan *sqq.Job[createUser], 1)}
 	consumer.Queue(u.Create)
 	stop := start(t, consumer)
 	job := receive(t, u.jobs)
@@ -201,10 +200,11 @@ func TestPushWithoutRegistration(t *testing.T) {
 
 func TestPushPointer(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
-	u := &users{jobs: make(chan *pgq.Job[createUser], 2)}
+	queues := dial(t, path)
+	db := database(t, path)
+	u := &users{jobs: make(chan *sqq.Job[createUser], 2)}
 	queues.Queue(u.Create)
 	is.NoErr(queues.Push(ctx, &createUser{Name: "dave"}))
 	is.NoErr(queues.Push(ctx, createUser{Name: "erin"}))
@@ -226,7 +226,7 @@ type mailer struct {
 	attempts  chan int
 }
 
-func (m *mailer) Send(ctx context.Context, job *pgq.Job[sendEmail]) error {
+func (m *mailer) Send(ctx context.Context, job *sqq.Job[sendEmail]) error {
 	m.attempts <- job.Attempt
 	if job.Attempt == m.succeedOn {
 		return nil
@@ -236,9 +236,10 @@ func (m *mailer) Send(ctx context.Context, job *pgq.Job[sendEmail]) error {
 
 func TestRetries(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	m := &mailer{succeedOn: 3, attempts: make(chan int, 10)}
 	queues.Queue(m.Send).Retries(2)
 	is.NoErr(queues.Push(ctx, sendEmail{To: "a@example.com"}))
@@ -253,9 +254,10 @@ func TestRetries(t *testing.T) {
 
 func TestRetriesExhausted(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	m := &mailer{succeedOn: -1, attempts: make(chan int, 10)}
 	queues.Queue(m.Send).Retries(1)
 	is.NoErr(queues.Push(ctx, sendEmail{To: "a@example.com"}))
@@ -279,7 +281,7 @@ type resizer struct {
 	release chan struct{}
 }
 
-func (r *resizer) Resize(ctx context.Context, job *pgq.Job[resizeImage]) error {
+func (r *resizer) Resize(ctx context.Context, job *sqq.Job[resizeImage]) error {
 	r.started <- job.Data.Path
 	<-r.release
 	return nil
@@ -287,9 +289,10 @@ func (r *resizer) Resize(ctx context.Context, job *pgq.Job[resizeImage]) error {
 
 func TestConcurrency(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	r := &resizer{started: make(chan string, 4), release: make(chan struct{})}
 	queues.Queue(r.Resize).Concurrency(3)
 	for _, path := range []string{"a.png", "b.png", "c.png", "d.png"} {
@@ -324,7 +327,7 @@ type billing struct {
 	total int
 }
 
-func (b *billing) Charge(ctx context.Context, job *pgq.Job[chargeCard]) error {
+func (b *billing) Charge(ctx context.Context, job *sqq.Job[chargeCard]) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.seen[job.ID]++
@@ -334,10 +337,11 @@ func (b *billing) Charge(ctx context.Context, job *pgq.Job[chargeCard]) error {
 
 func TestCompetingWorkers(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	a := dial(t)
-	b := dial(t)
-	db := database(t)
+	a := dial(t, path)
+	b := dial(t, path)
+	db := database(t, path)
 	bill := &billing{seen: map[string]int{}}
 	a.Queue(bill.Charge).Concurrency(4)
 	b.Queue(bill.Charge).Concurrency(4)
@@ -366,7 +370,7 @@ type worker struct {
 	started chan struct{}
 }
 
-func (w *worker) Run(ctx context.Context, job *pgq.Job[longTask]) error {
+func (w *worker) Run(ctx context.Context, job *sqq.Job[longTask]) error {
 	close(w.started)
 	<-ctx.Done()
 	return ctx.Err()
@@ -374,9 +378,10 @@ func (w *worker) Run(ctx context.Context, job *pgq.Job[longTask]) error {
 
 func TestShutdown(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	w := &worker{started: make(chan struct{})}
 	queues.Queue(w.Run).Retries(3)
 	is.NoErr(queues.Push(ctx, longTask{}))
@@ -391,8 +396,9 @@ func TestShutdown(t *testing.T) {
 
 func TestReclaimExpiredLease(t *testing.T) {
 	is := is.New(t)
-	queues := dial(t)
-	db := database(t)
+	path := file(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	m := &mailer{succeedOn: 2, attempts: make(chan int, 10)}
 	queues.Queue(m.Send).Retries(1)
 	crashed(t, db, sendEmail{}, 1)
@@ -404,30 +410,39 @@ func TestReclaimExpiredLease(t *testing.T) {
 
 func TestReclaimExhausted(t *testing.T) {
 	is := is.New(t)
-	queues := dial(t)
-	db := database(t)
+	path := file(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	m := &mailer{succeedOn: 3, attempts: make(chan int, 10)}
 	queues.Queue(m.Send).Retries(1)
 	crashed(t, db, sendEmail{}, 2)
 	stop := start(t, queues)
 	rows := waitFor(t, db, "test.send_email", "failed", 1)
 	stop()
-	is.Equal(*rows[0].LastError, "pgq: lease expired")
+	is.Equal(*rows[0].LastError, "sqq: lease expired")
 	is.Equal(len(m.attempts), 0)
 }
 
 func TestInvalidConfig(t *testing.T) {
 	is := is.New(t)
-	queues := dial(t)
+	path := file(t)
+	queues := dial(t, path)
 	w := &worker{started: make(chan struct{})}
 	queues.Queue(w.Run).Concurrency(0)
 	queues.Queue(w.Run).Retries(-1).Timeout(-time.Second)
 	err := queues.Start(context.Background())
 	is.True(err != nil)
-	is.Equal(err.Error(), `pgq: "test.long_task" concurrency must be at least 1
-pgq: "test.long_task" retries must not be negative
-pgq: "test.long_task" timeout must not be negative
-pgq: "test.long_task" is registered more than once`)
+	is.Equal(err.Error(), `sqq: "test.long_task" concurrency must be at least 1
+sqq: "test.long_task" retries must not be negative
+sqq: "test.long_task" timeout must not be negative
+sqq: "test.long_task" is registered more than once`)
+}
+
+func TestMemoryRejected(t *testing.T) {
+	is := is.New(t)
+	_, err := sqq.Dial(context.Background(), logger(t), ":memory:")
+	is.True(err != nil)
+	is.True(strings.Contains(err.Error(), "in-memory databases aren't supported"))
 }
 
 type importFile struct {
@@ -440,16 +455,17 @@ type importer struct {
 	attempts chan int
 }
 
-func (i *importer) Import(ctx context.Context, job *pgq.Job[importFile]) error {
+func (i *importer) Import(ctx context.Context, job *sqq.Job[importFile]) error {
 	i.attempts <- job.Attempt
-	return pgq.Permanent(errors.New("unsupported format"))
+	return sqq.Permanent(errors.New("unsupported format"))
 }
 
 func TestPermanent(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	i := &importer{attempts: make(chan int, 10)}
 	queues.Queue(i.Import).Retries(3)
 	is.NoErr(queues.Push(ctx, importFile{Path: "a.xls"}))
@@ -463,12 +479,13 @@ func TestPermanent(t *testing.T) {
 
 func TestDecodeError(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
-	u := &users{jobs: make(chan *pgq.Job[createUser], 1)}
+	queues := dial(t, path)
+	db := database(t, path)
+	u := &users{jobs: make(chan *sqq.Job[createUser], 1)}
 	queues.Queue(u.Create).Retries(3)
-	_, err := db.Exec(ctx, `INSERT INTO pgq_jobs (queue, payload) VALUES ('test.create_user', '"not an object"')`)
+	_, err := db.ExecContext(ctx, `INSERT INTO sqq_jobs (queue, payload, run_at, created_at, updated_at) VALUES ('test.create_user', '"not an object"', 0, 0, 0)`)
 	is.NoErr(err)
 	stop := start(t, queues)
 	rows := waitFor(t, db, "test.create_user", "failed", 1)
@@ -486,7 +503,7 @@ type sleeper struct {
 	errs chan error
 }
 
-func (s *sleeper) Run(ctx context.Context, job *pgq.Job[slowTask]) error {
+func (s *sleeper) Run(ctx context.Context, job *sqq.Job[slowTask]) error {
 	<-ctx.Done()
 	s.errs <- ctx.Err()
 	return ctx.Err()
@@ -494,9 +511,10 @@ func (s *sleeper) Run(ctx context.Context, job *pgq.Job[slowTask]) error {
 
 func TestTimeout(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	s := &sleeper{errs: make(chan error, 1)}
 	queues.Queue(s.Run).Timeout(50 * time.Millisecond)
 	is.NoErr(queues.Push(ctx, slowTask{}))
@@ -509,20 +527,21 @@ func TestTimeout(t *testing.T) {
 
 func TestPushTx(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	// Rolled back, so never enqueued
-	tx, err := db.Begin(ctx)
+	tx, err := db.BeginTx(ctx, nil)
 	is.NoErr(err)
 	is.NoErr(queues.PushTx(ctx, tx, createUser{Name: "mallory"}))
-	is.NoErr(tx.Rollback(ctx))
+	is.NoErr(tx.Rollback())
 	// Committed
-	tx, err = db.Begin(ctx)
+	tx, err = db.BeginTx(ctx, nil)
 	is.NoErr(err)
 	is.NoErr(queues.PushTx(ctx, tx, createUser{Name: "carol"}))
-	is.NoErr(tx.Commit(ctx))
-	u := &users{jobs: make(chan *pgq.Job[createUser], 2)}
+	is.NoErr(tx.Commit())
+	u := &users{jobs: make(chan *sqq.Job[createUser], 2)}
 	queues.Queue(u.Create)
 	stop := start(t, queues)
 	job := receive(t, u.jobs)
@@ -538,7 +557,7 @@ type flaky struct {
 }
 
 // Send fails the first call and succeeds afterwards
-func (f *flaky) Send(ctx context.Context, job *pgq.Job[sendEmail]) error {
+func (f *flaky) Send(ctx context.Context, job *sqq.Job[sendEmail]) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -551,9 +570,10 @@ func (f *flaky) Send(ctx context.Context, job *pgq.Job[sendEmail]) error {
 
 func TestRevive(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	db := database(t)
+	queues := dial(t, path)
+	db := database(t, path)
 	f := &flaky{done: make(chan int, 1)}
 	queues.Queue(f.Send)
 	is.NoErr(queues.Push(ctx, sendEmail{To: "a@example.com"}))
@@ -571,17 +591,18 @@ func TestRevive(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	is := is.New(t)
+	path := file(t)
 	ctx := context.Background()
-	queues := dial(t)
-	database(t)
+	queues := dial(t, path)
+	database(t, path)
 	is.NoErr(queues.Push(ctx, createUser{Name: "alice"}))
 	is.NoErr(queues.Push(ctx, createUser{Name: "bob"}))
 	stats, err := queues.Stats(ctx, "test.create_user")
 	is.NoErr(err)
-	is.Equal(stats, &pgq.Stats{Pending: 2})
+	is.Equal(stats, &sqq.Stats{Pending: 2})
 	stats, err = queues.Stats(ctx, "test.unknown")
 	is.NoErr(err)
-	is.Equal(stats, &pgq.Stats{})
+	is.Equal(stats, &sqq.Stats{})
 }
 
 type RunSession struct {
@@ -600,13 +621,13 @@ type session struct {
 	done context.CancelFunc // stops the example once the job is handled
 }
 
-func (s *session) Run(ctx context.Context, job *pgq.Job[RunSession]) error {
+func (s *session) Run(ctx context.Context, job *sqq.Job[RunSession]) error {
 	fmt.Println("running session", job.Data.SessionID)
 	s.done()
 	return nil
 }
 
-func (s *session) Interrupt(ctx context.Context, job *pgq.Job[InterruptSession]) error {
+func (s *session) Interrupt(ctx context.Context, job *sqq.Job[InterruptSession]) error {
 	fmt.Println("interrupting session", job.Data.SessionID)
 	s.done()
 	return nil
@@ -615,7 +636,12 @@ func (s *session) Interrupt(ctx context.Context, job *pgq.Job[InterruptSession])
 func Example() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	queues, err := pgq.Dial(ctx, slog.Default(), databaseURL())
+	dir, err := os.MkdirTemp("", "sqq")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	queues, err := sqq.Dial(ctx, slog.Default(), filepath.Join(dir, "jobs.db"))
 	if err != nil {
 		panic(err)
 	}
@@ -629,7 +655,7 @@ func Example() {
 	queues.Queue(session.Interrupt).
 		Concurrency(5)
 
-	// Produce jobs from anywhere with *pgq.Queues. No queue names needed.
+	// Produce jobs from anywhere with *sqq.Queues. No queue names needed.
 	if err := queues.Push(ctx, RunSession{SessionID: "123"}); err != nil {
 		panic(err)
 	}
@@ -645,8 +671,15 @@ func ExampleQueues_Push() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	dir, err := os.MkdirTemp("", "sqq")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "jobs.db")
+
 	// A producer pushes jobs without registering any handlers
-	producer, err := pgq.Dial(ctx, slog.Default(), databaseURL())
+	producer, err := sqq.Dial(ctx, slog.Default(), path)
 	if err != nil {
 		panic(err)
 	}
@@ -656,7 +689,7 @@ func ExampleQueues_Push() {
 	}
 
 	// A consumer, typically another process, handles them
-	consumer, err := pgq.Dial(ctx, slog.Default(), databaseURL())
+	consumer, err := sqq.Dial(ctx, slog.Default(), path)
 	if err != nil {
 		panic(err)
 	}
@@ -679,7 +712,7 @@ type welcome struct {
 	done context.CancelFunc
 }
 
-func (w *welcome) Send(ctx context.Context, job *pgq.Job[SendWelcome]) error {
+func (w *welcome) Send(ctx context.Context, job *sqq.Job[SendWelcome]) error {
 	if job.Attempt < 3 {
 		fmt.Println("attempt", job.Attempt, "failed")
 		return errors.New("smtp unavailable")
@@ -692,7 +725,12 @@ func (w *welcome) Send(ctx context.Context, job *pgq.Job[SendWelcome]) error {
 func ExampleConfig_Retries() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	queues, err := pgq.Dial(ctx, slog.Default(), databaseURL())
+	dir, err := os.MkdirTemp("", "sqq")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	queues, err := sqq.Dial(ctx, slog.Default(), filepath.Join(dir, "jobs.db"))
 	if err != nil {
 		panic(err)
 	}

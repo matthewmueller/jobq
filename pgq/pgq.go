@@ -6,22 +6,44 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime/debug"
-	"strconv"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/matthewmueller/jobq"
-	"github.com/matthewmueller/jobq/internal/backoff"
+	"github.com/matthewmueller/jobq/internal/sqlq"
 )
 
 type Payload = jobq.Payload
 type Job[T Payload] = jobq.Job[T]
 type Handler[T Payload] = jobq.Handler[T]
 type Stats = jobq.Stats
+
+// Config configures how a registered queue is consumed
+type Config struct {
+	config *sqlq.Config
+}
+
+// Concurrency sets the maximum number of jobs this process runs at once for
+// the queue. Defaults to 1.
+func (c *Config) Concurrency(n int) *Config {
+	c.config.Concurrency(n)
+	return c
+}
+
+// Retries sets how many times a failed job is retried. Defaults to 0.
+func (c *Config) Retries(n int) *Config {
+	c.config.Retries(n)
+	return c
+}
+
+// Timeout bounds how long a handler may run before its context is cancelled
+// and the attempt fails. Defaults to no timeout.
+func (c *Config) Timeout(d time.Duration) *Config {
+	c.config.Timeout(d)
+	return c
+}
 
 // Permanent marks err as non-retryable, so the job fails immediately
 func Permanent(err error) error {
@@ -59,82 +81,25 @@ func Dial(ctx context.Context, log *slog.Logger, url string) (*Queues, error) {
 		pool.Close()
 		return nil, fmt.Errorf("pgq: unable to create schema: %w", err)
 	}
+	log = log.With("package", "pgq")
 	return &Queues{
-		pool:  pool,
-		log:   log.With("package", "pgq"),
-		lease: 30 * time.Second,
-		poll:  500 * time.Millisecond,
+		pool: pool,
+		log:  log,
+		sqlq: sqlq.New("pgq", &store{pool}, log),
 	}, nil
 }
 
 // Queues produces and consumes jobs backed by PostgreSQL
 type Queues struct {
-	pool    *pgxpool.Pool
-	log     *slog.Logger
-	lease   time.Duration // how long a claimed job is reserved before others may reclaim it
-	poll    time.Duration // how long an idle worker waits before checking for jobs again
-	configs []*Config
-}
-
-// Config configures how a registered queue is consumed
-type Config struct {
-	queue       string
-	concurrency int
-	retries     int
-	timeout     time.Duration
-	handle      func(ctx context.Context, j *job) error
-}
-
-// Concurrency sets the maximum number of jobs this process runs at once for
-// the queue. Defaults to 1.
-func (c *Config) Concurrency(n int) *Config {
-	c.concurrency = n
-	return c
-}
-
-// Retries sets how many times a failed job is retried. Defaults to 0.
-func (c *Config) Retries(n int) *Config {
-	c.retries = n
-	return c
-}
-
-// Timeout bounds how long a handler may run before its context is cancelled
-// and the attempt fails. Defaults to no timeout.
-func (c *Config) Timeout(d time.Duration) *Config {
-	c.timeout = d
-	return c
-}
-
-// job is the untyped persisted job
-type job struct {
-	id        int64
-	payload   []byte
-	attempt   int
-	createdAt time.Time
+	pool *pgxpool.Pool
+	log  *slog.Logger
+	sqlq *sqlq.Worker
 }
 
 // Queue registers a handler for the queue named by T. Register handlers
 // before calling Start.
 func (q *Queues) Queue[T Payload](handler Handler[T]) *Config {
-	var zero T
-	config := &Config{
-		queue:       zero.Queue(),
-		concurrency: 1,
-		handle: func(ctx context.Context, j *job) error {
-			var data T
-			if err := json.Unmarshal(j.payload, &data); err != nil {
-				return jobq.Permanent(fmt.Errorf("pgq: unable to decode job %d: %w", j.id, err))
-			}
-			return handler(ctx, &Job[T]{
-				ID:        strconv.FormatInt(j.id, 10),
-				Data:      data,
-				Attempt:   j.attempt,
-				CreatedAt: j.createdAt,
-			})
-		},
-	}
-	q.configs = append(q.configs, config)
-	return config
+	return &Config{q.sqlq.Register(handler)}
 }
 
 // Push enqueues the payload onto the queue it names
@@ -166,16 +131,16 @@ func insert(ctx context.Context, db execer, payload Payload) error {
 	return nil
 }
 
-// Redrive moves the queue's failed jobs back to pending with fresh attempts
-func (q *Queues) Redrive(ctx context.Context, queue string) error {
+// Revive moves the queue's failed jobs back to pending with fresh attempts
+func (q *Queues) Revive(ctx context.Context, queue string) error {
 	tag, err := q.pool.Exec(ctx, `
 		UPDATE pgq_jobs SET state = 'pending', attempts = 0, run_at = now(), last_error = NULL, updated_at = now()
 		WHERE queue = $1 AND state = 'failed'
 	`, queue)
 	if err != nil {
-		return fmt.Errorf("pgq: unable to redrive %q: %w", queue, err)
+		return fmt.Errorf("pgq: unable to revive %q: %w", queue, err)
 	}
-	q.log.Info("redrove failed jobs", "queue", queue, "count", tag.RowsAffected())
+	q.log.Info("revived failed jobs", "queue", queue, "count", tag.RowsAffected())
 	return nil
 }
 
@@ -212,17 +177,7 @@ func (q *Queues) Stats(ctx context.Context, queue string) (*Stats, error) {
 // cancelled and running handlers have returned. Database errors are logged
 // and retried rather than returned.
 func (q *Queues) Start(ctx context.Context) error {
-	if err := q.validate(); err != nil {
-		return err
-	}
-	var wg sync.WaitGroup
-	for _, config := range q.configs {
-		for range config.concurrency {
-			wg.Go(func() { q.work(ctx, config) })
-		}
-	}
-	wg.Wait()
-	return nil
+	return q.sqlq.Start(ctx)
 }
 
 // Close releases the database connections
@@ -231,70 +186,17 @@ func (q *Queues) Close() error {
 	return nil
 }
 
-func (q *Queues) validate() error {
-	var errs []error
-	seen := map[string]bool{}
-	for _, c := range q.configs {
-		if c.queue == "" {
-			errs = append(errs, fmt.Errorf("pgq: queue name must not be empty"))
-		}
-		if c.concurrency < 1 {
-			errs = append(errs, fmt.Errorf("pgq: %q concurrency must be at least 1", c.queue))
-		}
-		if c.retries < 0 {
-			errs = append(errs, fmt.Errorf("pgq: %q retries must not be negative", c.queue))
-		}
-		if c.timeout < 0 {
-			errs = append(errs, fmt.Errorf("pgq: %q timeout must not be negative", c.queue))
-		}
-		if seen[c.queue] {
-			errs = append(errs, fmt.Errorf("pgq: %q is registered more than once", c.queue))
-		}
-		seen[c.queue] = true
-	}
-	return errors.Join(errs...)
+// store implements sqlq.Store for PostgreSQL. Competing workers skip
+// each other's locked rows when claiming.
+type store struct {
+	pool *pgxpool.Pool
 }
 
-// work claims and runs jobs until ctx is cancelled. Database errors back off
-// and retry so a blip doesn't stop the worker.
-func (q *Queues) work(ctx context.Context, c *Config) {
-	failures := 0
-	for ctx.Err() == nil {
-		j, err := q.claim(ctx, c)
-		if err == nil && j != nil {
-			err = q.run(ctx, c, j)
-		}
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			failures++
-			q.log.Error("worker error", "queue", c.queue, "error", err)
-			sleep(ctx, min(backoff.Delay(failures), 30*time.Second))
-			continue
-		}
-		failures = 0
-		if j == nil {
-			sleep(ctx, q.poll)
-		}
-	}
-}
+var _ sqlq.Store = (*store)(nil)
 
-// sleep waits for d or until ctx is cancelled
-func sleep(ctx context.Context, d time.Duration) {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-	case <-timer.C:
-	}
-}
-
-// claim reserves the next available job, or returns nil if there are none.
-// Jobs whose lease expired (e.g. their worker crashed) are reclaimed.
-func (q *Queues) claim(ctx context.Context, c *Config) (*job, error) {
-	j := new(job)
-	err := q.pool.QueryRow(ctx, `
+func (s *store) Claim(ctx context.Context, queue string, retries int, lease time.Duration) (*sqlq.Job, error) {
+	j := new(sqlq.Job)
+	err := s.pool.QueryRow(ctx, `
 		UPDATE pgq_jobs SET
 			state = 'running',
 			attempts = attempts + 1,
@@ -312,126 +214,59 @@ func (q *Queues) claim(ctx context.Context, c *Config) (*job, error) {
 			LIMIT 1
 		)
 		RETURNING id, payload, attempts, created_at
-	`, c.queue, c.retries, q.lease.Milliseconds()).Scan(&j.id, &j.payload, &j.attempt, &j.createdAt)
+	`, queue, retries, lease.Milliseconds()).Scan(&j.ID, &j.Payload, &j.Attempt, &j.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	} else if err != nil {
-		return nil, fmt.Errorf("pgq: unable to claim from %q: %w", c.queue, err)
+		return nil, fmt.Errorf("pgq: unable to claim from %q: %w", queue, err)
 	}
 	return j, nil
 }
 
-// run calls the handler and records the outcome
-func (q *Queues) run(ctx context.Context, c *Config, j *job) error {
-	// A reclaimed job that already used up its attempts (e.g. it keeps
-	// crashing the process) is failed rather than run again.
-	if j.attempt > c.retries+1 {
-		return q.finish(ctx, c, j, errors.New("pgq: lease expired"))
-	}
-	stop := q.heartbeat(ctx, j)
-	err := q.call(ctx, c, j)
-	stop()
-	return q.finish(ctx, c, j, err)
+func (s *store) Extend(ctx context.Context, j *sqlq.Job, lease time.Duration) error {
+	return s.update(ctx, j, `
+		UPDATE pgq_jobs SET locked_until = now() + $3 * interval '1 millisecond', updated_at = now()
+		WHERE id = $1 AND attempts = $2 AND state = 'running'
+	`, lease.Milliseconds())
 }
 
-// call invokes the handler with the configured timeout, converting panics
-// into errors
-func (q *Queues) call(ctx context.Context, c *Config, j *job) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			q.log.Error("handler panicked", "queue", c.queue, "job", j.id, "panic", r, "stack", string(debug.Stack()))
-			err = fmt.Errorf("pgq: handler panicked: %v", r)
-		}
-	}()
-	if c.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.timeout)
-		defer cancel()
-	}
-	return c.handle(ctx, j)
+func (s *store) Complete(ctx context.Context, j *sqlq.Job) error {
+	return s.update(ctx, j, `
+		UPDATE pgq_jobs SET state = 'completed', locked_until = NULL, updated_at = now()
+		WHERE id = $1 AND attempts = $2 AND state = 'running'
+	`)
 }
 
-// heartbeat extends the job's lease while the handler runs
-func (q *Queues) heartbeat(ctx context.Context, j *job) (stop func()) {
-	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(q.lease / 3)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// Errors are retried on the next tick, well before the lease expires
-				if _, err := q.pool.Exec(ctx, `
-					UPDATE pgq_jobs SET locked_until = now() + $3 * interval '1 millisecond', updated_at = now()
-					WHERE id = $1 AND attempts = $2 AND state = 'running'
-				`, j.id, j.attempt, q.lease.Milliseconds()); err != nil && ctx.Err() == nil {
-					q.log.Warn("unable to extend lease", "job", j.id, "error", err)
-				}
-			}
-		}
-	}()
-	return func() {
-		cancel()
-		<-done
-	}
+func (s *store) Release(ctx context.Context, j *sqlq.Job) error {
+	return s.update(ctx, j, `
+		UPDATE pgq_jobs SET state = 'pending', attempts = attempts - 1, locked_until = NULL, updated_at = now()
+		WHERE id = $1 AND attempts = $2 AND state = 'running'
+	`)
 }
 
-// finish records the handler's result. Every update is fenced on the attempt
-// number so a worker whose lease expired can't clobber a newer claim.
-func (q *Queues) finish(ctx context.Context, c *Config, j *job, err error) error {
-	// Record the result even if we're shutting down
-	shutdown := ctx.Err() != nil
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	log := q.log.With("queue", c.queue, "job", j.id, "attempt", j.attempt)
-	switch {
-	case err == nil:
-		return q.update(ctx, j, `
-			UPDATE pgq_jobs SET state = 'completed', locked_until = NULL, updated_at = now()
-			WHERE id = $1 AND attempts = $2 AND state = 'running'
-		`)
-	case jobq.IsPermanent(err):
-		// Honored even during shutdown, since it should never be retried
-		return q.fail(ctx, log, j, err)
-	case shutdown:
-		// Interrupted by shutdown, so release the job without using up an attempt
-		return q.update(ctx, j, `
-			UPDATE pgq_jobs SET state = 'pending', attempts = attempts - 1, locked_until = NULL, updated_at = now()
-			WHERE id = $1 AND attempts = $2 AND state = 'running'
-		`)
-	case j.attempt <= c.retries:
-		delay := backoff.Delay(j.attempt)
-		log.Warn("job failed, retrying", "error", err, "delay", delay)
-		return q.update(ctx, j, `
-			UPDATE pgq_jobs SET
-				state = 'pending',
-				run_at = now() + $4 * interval '1 millisecond',
-				last_error = $3,
-				locked_until = NULL,
-				updated_at = now()
-			WHERE id = $1 AND attempts = $2 AND state = 'running'
-		`, err.Error(), delay.Milliseconds())
-	default:
-		return q.fail(ctx, log, j, err)
-	}
+func (s *store) Retry(ctx context.Context, j *sqlq.Job, delay time.Duration, err error) error {
+	return s.update(ctx, j, `
+		UPDATE pgq_jobs SET
+			state = 'pending',
+			run_at = now() + $4 * interval '1 millisecond',
+			last_error = $3,
+			locked_until = NULL,
+			updated_at = now()
+		WHERE id = $1 AND attempts = $2 AND state = 'running'
+	`, err.Error(), delay.Milliseconds())
 }
 
-// fail permanently fails the job, leaving it in the dead-letter state
-func (q *Queues) fail(ctx context.Context, log *slog.Logger, j *job, err error) error {
-	log.Error("job failed", "error", err, "permanent", jobq.IsPermanent(err))
-	return q.update(ctx, j, `
+func (s *store) Fail(ctx context.Context, j *sqlq.Job, err error) error {
+	return s.update(ctx, j, `
 		UPDATE pgq_jobs SET state = 'failed', last_error = $3, locked_until = NULL, updated_at = now()
 		WHERE id = $1 AND attempts = $2 AND state = 'running'
 	`, err.Error())
 }
 
-func (q *Queues) update(ctx context.Context, j *job, sql string, args ...any) error {
-	if _, err := q.pool.Exec(ctx, sql, append([]any{j.id, j.attempt}, args...)...); err != nil {
-		return fmt.Errorf("pgq: unable to update job %d: %w", j.id, err)
+// update runs sql with the job's ID and attempt as $1 and $2
+func (s *store) update(ctx context.Context, j *sqlq.Job, sql string, args ...any) error {
+	if _, err := s.pool.Exec(ctx, sql, append([]any{j.ID, j.Attempt}, args...)...); err != nil {
+		return fmt.Errorf("pgq: unable to update job %d: %w", j.ID, err)
 	}
 	return nil
 }

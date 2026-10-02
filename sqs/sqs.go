@@ -158,11 +158,11 @@ func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
 	return nil
 }
 
-// Redrive starts moving the queue's dead-lettered messages back onto it. The
-// move happens asynchronously in SQS and only covers the messages SQS counts
-// when it starts, so messages dead-lettered moments ago may need another
-// Redrive.
-func (q *Queues) Redrive(ctx context.Context, queue string) error {
+// Revive starts moving the queue's dead-lettered messages back onto it, using
+// an SQS DLQ redrive. The move happens asynchronously in SQS and only covers
+// the messages SQS counts when it starts, so messages dead-lettered moments
+// ago may need another Revive.
+func (q *Queues) Revive(ctx context.Context, queue string) error {
 	r, err := q.redrive(ctx, queue)
 	if err != nil {
 		return err
@@ -175,9 +175,9 @@ func (q *Queues) Redrive(ctx context.Context, queue string) error {
 		// than by the redrive policy
 		DestinationArn: aws.String(r.queueARN),
 	}); err != nil {
-		return fmt.Errorf("sqs: unable to redrive %q: %w", queue, err)
+		return fmt.Errorf("sqs: unable to revive %q: %w", queue, err)
 	}
-	q.log.Info("started redrive", "queue", queue)
+	q.log.Info("started reviving dead-lettered messages", "queue", queue)
 	return nil
 }
 
