@@ -1,3 +1,8 @@
+# 0.0.3 / 2026-10-02
+
+- add listen/notify wake-ups to pgq
+- add nats jetstream backend (jetq)
+
 # 0.0.2 / 2026-10-01
 
 - add sqlite backend (sqq) on a shared sql worker engine
