@@ -88,7 +88,7 @@ func Dial(ctx context.Context, log *slog.Logger, path string) (*Queues, error) {
 	return &Queues{
 		db:   db,
 		log:  log,
-		sqlq: sqlq.New("sqq", &store{db}, log),
+		sqlq: sqlq.New("sqq", &store{db}, log, 500*time.Millisecond),
 	}, nil
 }
 
@@ -119,7 +119,13 @@ func (q *Queues) Queue[T Payload](handler Handler[T]) *Config {
 
 // Push enqueues the payload onto the queue it names
 func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
-	return insert(ctx, q.db, payload)
+	if err := insert(ctx, q.db, payload); err != nil {
+		return err
+	}
+	// SQLite can't notify other processes, but this process's idle workers
+	// can start right away. Other processes find the job when they poll.
+	q.sqlq.Notify(payload.Queue())
+	return nil
 }
 
 // PushTx enqueues the payload within tx, so the job only exists if tx commits
@@ -160,6 +166,7 @@ func (q *Queues) Revive(ctx context.Context, queue string) error {
 	}
 	count, _ := res.RowsAffected()
 	q.log.Info("revived failed jobs", "queue", queue, "count", count)
+	q.sqlq.Notify(queue)
 	return nil
 }
 

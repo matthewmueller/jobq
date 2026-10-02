@@ -605,6 +605,24 @@ func TestStats(t *testing.T) {
 	is.Equal(stats, &sqq.Stats{})
 }
 
+func TestNotify(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	path := file(t)
+	queues := dial(t, path)
+	u := &users{jobs: make(chan *sqq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	// Let the worker go idle, so without a notification it would wait for the
+	// 500ms poll
+	time.Sleep(50 * time.Millisecond)
+	pushed := time.Now()
+	is.NoErr(queues.Push(ctx, createUser{Name: "alice"}))
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	is.True(time.Since(pushed) < 250*time.Millisecond)
+	stop()
+}
+
 type RunSession struct {
 	SessionID string
 }

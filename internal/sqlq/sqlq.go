@@ -46,14 +46,15 @@ type Job struct {
 }
 
 // New returns a Worker that processes jobs from store. The name prefixes
-// errors, e.g. "pgq".
-func New(name string, store Store, log *slog.Logger) *Worker {
+// errors, e.g. "pgq". Idle workers check for jobs every poll, or sooner when
+// notified.
+func New(name string, store Store, log *slog.Logger, poll time.Duration) *Worker {
 	return &Worker{
 		name:  name,
 		store: store,
 		log:   log,
 		lease: 30 * time.Second,
-		poll:  500 * time.Millisecond,
+		poll:  poll,
 	}
 }
 
@@ -75,6 +76,16 @@ type Config struct {
 	retries     int
 	timeout     time.Duration
 	handle      func(ctx context.Context, j *Job) error
+	wake        chan struct{} // wakes one idle worker
+}
+
+// signal wakes one idle worker for the queue. Signals collapse while no
+// worker is waiting, and never block.
+func (c *Config) signal() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
 }
 
 // Concurrency sets the maximum number of jobs this process runs at once for
@@ -104,6 +115,7 @@ func (w *Worker) Register[T jobq.Payload](handler jobq.Handler[T]) *Config {
 	config := &Config{
 		queue:       zero.Queue(),
 		concurrency: 1,
+		wake:        make(chan struct{}, 1),
 		handle: func(ctx context.Context, j *Job) error {
 			var data T
 			if err := json.Unmarshal(j.Payload, &data); err != nil {
@@ -119,6 +131,24 @@ func (w *Worker) Register[T jobq.Payload](handler jobq.Handler[T]) *Config {
 	}
 	w.configs = append(w.configs, config)
 	return config
+}
+
+// Notify wakes an idle worker for the queue, e.g. when a job was pushed.
+// Queues this process doesn't handle are ignored.
+func (w *Worker) Notify(queue string) {
+	for _, c := range w.configs {
+		if c.queue == queue {
+			c.signal()
+		}
+	}
+}
+
+// NotifyAll wakes an idle worker for every queue, e.g. after notifications
+// may have been missed
+func (w *Worker) NotifyAll() {
+	for _, c := range w.configs {
+		c.signal()
+	}
 }
 
 // Start processes jobs for all registered queues. It blocks until ctx is
@@ -169,6 +199,8 @@ func (w *Worker) work(ctx context.Context, c *Config) {
 	for ctx.Err() == nil {
 		j, err := w.store.Claim(ctx, c.queue, c.retries, w.lease)
 		if err == nil && j != nil {
+			// There may be more jobs, so get another worker checking too
+			c.signal()
 			err = w.run(ctx, c, j)
 		}
 		if err != nil {
@@ -182,8 +214,19 @@ func (w *Worker) work(ctx context.Context, c *Config) {
 		}
 		failures = 0
 		if j == nil {
-			sleep(ctx, w.poll)
+			idle(ctx, c, w.poll)
 		}
+	}
+}
+
+// idle waits until the queue is signaled, poll elapses or ctx is cancelled
+func idle(ctx context.Context, c *Config, poll time.Duration) {
+	timer := time.NewTimer(poll)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-c.wake:
+	case <-timer.C:
 	}
 }
 
@@ -273,7 +316,12 @@ func (w *Worker) finish(ctx context.Context, c *Config, j *Job, err error) error
 	case j.Attempt <= c.retries:
 		delay := backoff.Delay(j.Attempt)
 		log.Warn("job failed, retrying", "error", err, "delay", delay)
-		return w.store.Retry(ctx, j, delay, err)
+		if retryErr := w.store.Retry(ctx, j, delay, err); retryErr != nil {
+			return retryErr
+		}
+		// Wake a worker when the retry is due rather than at the next poll
+		time.AfterFunc(delay, c.signal)
+		return nil
 	default:
 		log.Error("job failed", "error", err, "permanent", false)
 		return w.store.Fail(ctx, j, err)

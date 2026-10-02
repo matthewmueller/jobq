@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/matthewmueller/jobq"
+	"github.com/matthewmueller/jobq/internal/backoff"
 	"github.com/matthewmueller/jobq/internal/sqlq"
 )
 
@@ -51,7 +53,8 @@ func Permanent(err error) error {
 }
 
 // schema is idempotent. The advisory lock serializes concurrent Dials, since
-// CREATE ... IF NOT EXISTS can race across processes.
+// CREATE ... IF NOT EXISTS can race across processes. The trigger notifies
+// listening workers whenever a job becomes pending, on commit.
 const schema = `
 SELECT pg_advisory_xact_lock(hashtext('pgq_jobs'));
 CREATE TABLE IF NOT EXISTS pgq_jobs (
@@ -69,6 +72,16 @@ CREATE TABLE IF NOT EXISTS pgq_jobs (
 );
 CREATE INDEX IF NOT EXISTS pgq_jobs_pending ON pgq_jobs (queue, run_at, id) WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS pgq_jobs_running ON pgq_jobs (queue, locked_until) WHERE state = 'running';
+CREATE OR REPLACE FUNCTION pgq_notify() RETURNS trigger AS $$
+BEGIN
+	PERFORM pg_notify('pgq_jobs', NEW.queue);
+	RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE TRIGGER pgq_jobs_notify
+	AFTER INSERT OR UPDATE OF state ON pgq_jobs
+	FOR EACH ROW WHEN (NEW.state = 'pending')
+	EXECUTE FUNCTION pgq_notify();
 `
 
 // Dial connects to PostgreSQL and creates the jobs table if needed
@@ -85,7 +98,8 @@ func Dial(ctx context.Context, log *slog.Logger, url string) (*Queues, error) {
 	return &Queues{
 		pool: pool,
 		log:  log,
-		sqlq: sqlq.New("pgq", &store{pool}, log),
+		// Notifications wake idle workers, so polling is only a fallback
+		sqlq: sqlq.New("pgq", &store{pool}, log, 5*time.Second),
 	}, nil
 }
 
@@ -177,7 +191,60 @@ func (q *Queues) Stats(ctx context.Context, queue string) (*Stats, error) {
 // cancelled and running handlers have returned. Database errors are logged
 // and retried rather than returned.
 func (q *Queues) Start(ctx context.Context) error {
-	return q.sqlq.Start(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Go(func() { q.listen(ctx) })
+	err := q.sqlq.Start(ctx)
+	cancel()
+	wg.Wait()
+	return err
+}
+
+// listen wakes idle workers when jobs become pending, reconnecting until ctx
+// is cancelled. Workers fall back to polling while it's disconnected.
+func (q *Queues) listen(ctx context.Context) {
+	failures := 0
+	for ctx.Err() == nil {
+		err := q.listenOnce(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		failures++
+		q.log.Warn("listener disconnected, polling until it reconnects", "error", err)
+		sleep(ctx, min(backoff.Delay(failures), 30*time.Second))
+	}
+}
+
+// listenOnce listens on a dedicated connection, since LISTEN is tied to the
+// session and pooled connections are shared
+func (q *Queues) listenOnce(ctx context.Context) error {
+	conn, err := pgx.ConnectConfig(ctx, q.pool.Config().ConnConfig)
+	if err != nil {
+		return fmt.Errorf("pgq: unable to connect listener: %w", err)
+	}
+	defer conn.Close(context.WithoutCancel(ctx))
+	if _, err := conn.Exec(ctx, "LISTEN pgq_jobs"); err != nil {
+		return fmt.Errorf("pgq: unable to listen: %w", err)
+	}
+	// Catch up on anything pushed while we weren't listening
+	q.sqlq.NotifyAll()
+	for {
+		notification, err := conn.WaitForNotification(ctx)
+		if err != nil {
+			return fmt.Errorf("pgq: unable to wait for notifications: %w", err)
+		}
+		q.sqlq.Notify(notification.Payload)
+	}
+}
+
+// sleep waits for d or until ctx is cancelled
+func sleep(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 // Close releases the database connections

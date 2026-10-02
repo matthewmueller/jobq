@@ -584,6 +584,92 @@ func TestStats(t *testing.T) {
 	is.Equal(stats, &pgq.Stats{})
 }
 
+func TestNotify(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	database(t)
+	u := &users{jobs: make(chan *pgq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	// Let the worker go idle, so only a notification can wake it before the
+	// 5s poll
+	time.Sleep(200 * time.Millisecond)
+	pushed := time.Now()
+	is.NoErr(queues.Push(ctx, createUser{Name: "alice"}))
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	is.True(time.Since(pushed) < time.Second)
+	stop()
+}
+
+func TestNotifyTx(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	db := database(t)
+	u := &users{jobs: make(chan *pgq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	time.Sleep(200 * time.Millisecond)
+	tx, err := db.Begin(ctx)
+	is.NoErr(err)
+	is.NoErr(queues.PushTx(ctx, tx, createUser{Name: "carol"}))
+	select {
+	case <-u.jobs:
+		is.Fail() // the job shouldn't be visible until the transaction commits
+	case <-time.After(300 * time.Millisecond):
+	}
+	committed := time.Now()
+	is.NoErr(tx.Commit(ctx))
+	is.Equal(receive(t, u.jobs).Data.Name, "carol")
+	is.True(time.Since(committed) < time.Second)
+	stop()
+}
+
+// terminateListeners kills the database's LISTEN connections, waiting for at
+// least one to exist
+func terminateListeners(t testing.TB, db *pgxpool.Pool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var terminated int
+		err := db.QueryRow(context.Background(), `
+			SELECT count(*) FROM (
+				SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+				WHERE datname = current_database() AND query = 'LISTEN pgq_jobs'
+			) AS t
+		`).Scan(&terminated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if terminated > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for a listener")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestListenerReconnect(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	db := database(t)
+	u := &users{jobs: make(chan *pgq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	terminateListeners(t, db)
+	// The notification is lost, but the listener reconnects and catches up
+	// well before the 5s poll
+	pushed := time.Now()
+	is.NoErr(queues.Push(ctx, createUser{Name: "dave"}))
+	is.Equal(receive(t, u.jobs).Data.Name, "dave")
+	is.True(time.Since(pushed) < 3*time.Second)
+	stop()
+}
+
 type RunSession struct {
 	SessionID string
 }

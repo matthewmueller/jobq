@@ -129,11 +129,14 @@ Returning `nil` completes a job. Returning an error retries it after a backoff o
 - Failed jobs stay in `pgq_jobs` with `state = 'failed'` and `last_error`. `Revive` resets them to pending with fresh attempts.
 - Completed jobs are kept with `state = 'completed'`. Delete them periodically, e.g. `DELETE FROM pgq_jobs WHERE state = 'completed' AND updated_at < now() - interval '7 days'`.
 - Workers share the connection pool. Size it for the total concurrency with `pool_max_conns` in the URL, e.g. `postgres://…/app?pool_max_conns=20`.
+- Idle workers are woken by LISTEN/NOTIFY: a `pgq_jobs_notify` trigger notifies whenever a job becomes pending, on commit. Polling every 5s remains as a fallback. Requires PostgreSQL 14 or later.
+- Each `Queues` with registered handlers holds one extra connection, outside the pool, for `LISTEN`. It needs a direct or session-pooled connection, because PgBouncer's transaction pooling doesn't support `LISTEN`.
 
 ### SQLite
 
 - `Dial` takes a file path or `file:` URI and enables WAL mode, a 5 second busy timeout and immediate transactions. In-memory databases are rejected, since each pooled connection would get its own database.
 - Processes sharing a database must run on the same host, and the file must not be on a network filesystem.
+- SQLite has no LISTEN/NOTIFY, so idle workers poll every 500ms. `Push` and `Revive` wake idle workers in the same process immediately, while other processes and `PushTx` jobs wait for the next poll.
 - SQLite runs one writer at a time, so claims serialize. That's plenty for most job volumes, but use `pgq` for high write throughput.
 - For `PushTx`, open your own `*sql.DB` with `?_pragma=busy_timeout(5000)&_txlock=immediate` so transactions wait for the write lock instead of failing.
 - Failed and completed jobs stay in `sqq_jobs`, as with PostgreSQL. Times are Unix milliseconds, e.g. `DELETE FROM sqq_jobs WHERE state = 'completed' AND updated_at < unixepoch('now', '-7 days') * 1000`.
