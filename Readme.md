@@ -1,13 +1,18 @@
 # jobq
 
-Typed background job queues for Go, backed by PostgreSQL, SQLite, NATS JetStream or Amazon SQS. Payload types name their own queue and handlers are plain typed methods, so producers and consumers can't disagree about queue names or payloads.
+Dead-simple job queue for Go. Supports:
+
+- PostgreSQL
+- SQLite
+- NATS JetStream
+- Amazon SQS
 
 ## Features
 
-- Payload types are inferred from handlers: `queues.Queue(session.Run)`
-- Push from any process without registering handlers: `queues.Push(ctx, RunSession{...})`
+- Payload typed and inferred from their handlers: `queues.Queue(session.Run)`
+- Push from any process: `queues.Push(ctx, RunSession{...})`
 - Per-queue concurrency, retries with backoff, and timeouts
-- Dead-letter queues with `Revive` and `Stats`
+- Dead-letter queues with support for `Revive` and `Stats`
 
 ## Install
 
