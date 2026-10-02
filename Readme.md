@@ -122,7 +122,7 @@ Jobs are delivered **at least once**, so make handlers idempotent. Returning an 
 - **PostgreSQL:** completed jobs stay in `pgq_jobs`, so delete them periodically. `LISTEN` uses one extra connection per process running workers, which must be direct or session-pooled (PgBouncer's transaction pooling doesn't support it).
 - **SQLite:** other processes find new jobs by polling every 500ms. Don't put the file on a network filesystem.
 - **NATS JetStream:** queue names are dot-separated tokens. A delivery interrupted by a shutdown or crash counts as an attempt.
-- **SQS:** queue names may only use letters, numbers, hyphens and underscores. Retries come from each queue's redrive policy, where `maxReceiveCount` is the total number of attempts. The app needs `SendMessage`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`, `GetQueueAttributes` and `StartMessageMoveTask` on its queues, and `SendMessage`, `ReceiveMessage`, `DeleteMessage` and `GetQueueAttributes` on the dead-letter queues.
+- **SQS:** queue names may only use letters, numbers, hyphens and underscores. Each queue needs a dead-letter queue and permissions; see [docs/sqs.md](docs/sqs.md) for Terraform that sets them up.
 
 ## Development
 
