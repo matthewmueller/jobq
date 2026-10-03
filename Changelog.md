@@ -1,3 +1,7 @@
+# 0.0.4 / 2026-10-03
+
+- add support for adding lanes to the payload (sqlite and postgres only)
+
 # 0.0.3 / 2026-10-02
 
 - add listen/notify wake-ups to pgq
