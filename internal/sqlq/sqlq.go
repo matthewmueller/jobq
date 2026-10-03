@@ -37,6 +37,28 @@ type Store interface {
 	Fail(ctx context.Context, job *Job, err error) error
 }
 
+// Laned is implemented by payloads that run one at a time per lane. Jobs in
+// the same lane never run at the same time, even across processes. Jobs in
+// different lanes, and jobs without a lane, run concurrently. Jobs usually run
+// in the order they were pushed, but a job waiting to retry doesn't hold up
+// the rest of its lane.
+type Laned interface {
+	Lane() string
+}
+
+// Lane returns the payload's lane, or nil if it doesn't have one
+func Lane(payload jobq.Payload) *string {
+	laned, ok := payload.(Laned)
+	if !ok {
+		return nil
+	}
+	lane := laned.Lane()
+	if lane == "" {
+		return nil
+	}
+	return &lane
+}
+
 // Job is an untyped claimed job
 type Job struct {
 	ID        int64

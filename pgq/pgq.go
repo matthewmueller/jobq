@@ -22,6 +22,13 @@ type Job[T Payload] = jobq.Job[T]
 type Handler[T Payload] = jobq.Handler[T]
 type Stats = jobq.Stats
 
+// Laned is implemented by payloads that run one at a time per lane. Jobs in
+// the same lane never run at the same time, even across processes. Jobs in
+// different lanes, and jobs without a lane, run concurrently. Jobs usually run
+// in the order they were pushed, but a job waiting to retry doesn't hold up
+// the rest of its lane.
+type Laned = sqlq.Laned
+
 // Config configures how a registered queue is consumed
 type Config struct {
 	config *sqlq.Config
@@ -53,14 +60,16 @@ func Permanent(err error) error {
 }
 
 // schema is idempotent. The advisory lock serializes concurrent Dials, since
-// CREATE ... IF NOT EXISTS can race across processes. The trigger notifies
-// listening workers whenever a job becomes pending, on commit.
+// CREATE ... IF NOT EXISTS can race across processes. The lane index allows
+// one running job per lane. The trigger notifies listening workers whenever a
+// job becomes pending, on commit.
 const schema = `
 SELECT pg_advisory_xact_lock(hashtext('pgq_jobs'));
 CREATE TABLE IF NOT EXISTS pgq_jobs (
 	id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 	queue        text        NOT NULL,
 	payload      jsonb       NOT NULL,
+	lane         text,
 	state        text        NOT NULL DEFAULT 'pending',
 	attempts     int         NOT NULL DEFAULT 0,
 	max_retries  int         NOT NULL DEFAULT 0,
@@ -72,6 +81,9 @@ CREATE TABLE IF NOT EXISTS pgq_jobs (
 );
 CREATE INDEX IF NOT EXISTS pgq_jobs_pending ON pgq_jobs (queue, run_at, id) WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS pgq_jobs_running ON pgq_jobs (queue, locked_until) WHERE state = 'running';
+-- Added in v0.0.4
+ALTER TABLE pgq_jobs ADD COLUMN IF NOT EXISTS lane text;
+CREATE UNIQUE INDEX IF NOT EXISTS pgq_jobs_lane ON pgq_jobs (queue, lane) WHERE state = 'running' AND lane IS NOT NULL;
 CREATE OR REPLACE FUNCTION pgq_notify() RETURNS trigger AS $$
 BEGIN
 	PERFORM pg_notify('pgq_jobs', NEW.queue);
@@ -139,7 +151,7 @@ func insert(ctx context.Context, db execer, payload Payload) error {
 	if err != nil {
 		return fmt.Errorf("pgq: unable to encode %q payload: %w", queue, err)
 	}
-	if _, err := db.Exec(ctx, `INSERT INTO pgq_jobs (queue, payload) VALUES ($1, $2)`, queue, data); err != nil {
+	if _, err := db.Exec(ctx, `INSERT INTO pgq_jobs (queue, payload, lane) VALUES ($1, $2, $3)`, queue, data, sqlq.Lane(payload)); err != nil {
 		return fmt.Errorf("pgq: unable to push to %q: %w", queue, err)
 	}
 	return nil
@@ -261,7 +273,21 @@ type store struct {
 
 var _ sqlq.Store = (*store)(nil)
 
+// Claim skips jobs whose lane already has a running job, including one whose
+// lease expired, so it's reclaimed before the rest of its lane runs. Two
+// workers can still claim jobs in the same lane at once. The lane index fails
+// the second, which then claims again and skips that lane.
 func (s *store) Claim(ctx context.Context, queue string, retries int, lease time.Duration) (*sqlq.Job, error) {
+	for {
+		j, err := s.claim(ctx, queue, retries, lease)
+		if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == "23505" {
+			continue
+		}
+		return j, err
+	}
+}
+
+func (s *store) claim(ctx context.Context, queue string, retries int, lease time.Duration) (*sqlq.Job, error) {
 	j := new(sqlq.Job)
 	err := s.pool.QueryRow(ctx, `
 		UPDATE pgq_jobs SET
@@ -271,11 +297,14 @@ func (s *store) Claim(ctx context.Context, queue string, retries int, lease time
 			locked_until = now() + $3 * interval '1 millisecond',
 			updated_at = now()
 		WHERE id = (
-			SELECT id FROM pgq_jobs
+			SELECT id FROM pgq_jobs j
 			WHERE queue = $1 AND (
 				(state = 'pending' AND run_at <= now()) OR
 				(state = 'running' AND locked_until < now())
-			)
+			) AND (lane IS NULL OR NOT EXISTS (
+				SELECT 1 FROM pgq_jobs r
+				WHERE r.queue = j.queue AND r.lane = j.lane AND r.state = 'running' AND r.id <> j.id
+			))
 			ORDER BY run_at, id
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1

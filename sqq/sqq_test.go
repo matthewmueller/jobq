@@ -3,11 +3,13 @@ package sqq_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -137,11 +139,19 @@ func jobs(t testing.TB, db *sql.DB, queue string) []row {
 // crashed inserts a job that looks like its worker died mid-run
 func crashed(t testing.TB, db *sql.DB, payload sqq.Payload, attempts int) {
 	t.Helper()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lane *string
+	if laned, ok := payload.(sqq.Laned); ok {
+		lane = new(laned.Lane())
+	}
 	now := time.Now().UnixMilli()
-	_, err := db.ExecContext(context.Background(), `
-		INSERT INTO sqq_jobs (queue, payload, state, attempts, locked_until, run_at, created_at, updated_at)
-		VALUES (?1, '{}', 'running', ?2, ?3, ?4, ?4, ?4)
-	`, payload.Queue(), attempts, now-1000, now)
+	_, err = db.ExecContext(context.Background(), `
+		INSERT INTO sqq_jobs (queue, payload, lane, state, attempts, locked_until, run_at, created_at, updated_at)
+		VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?6, ?6)
+	`, payload.Queue(), string(data), lane, attempts, now-1000, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -621,6 +631,169 @@ func TestNotify(t *testing.T) {
 	is.Equal(receive(t, u.jobs).Data.Name, "alice")
 	is.True(time.Since(pushed) < 250*time.Millisecond)
 	stop()
+}
+
+type syncAccount struct {
+	Account string
+	N       int
+}
+
+func (syncAccount) Queue() string { return "test.sync_account" }
+
+// Lane runs an account's syncs one at a time
+func (s syncAccount) Lane() string { return s.Account }
+
+// syncer records the most jobs running at once in each lane
+type syncer struct {
+	started chan syncAccount
+	release chan struct{} // closed to let jobs finish
+	mu      sync.Mutex
+	running map[string]int
+	most    map[string]int
+}
+
+func newSyncer() *syncer {
+	return &syncer{
+		started: make(chan syncAccount, 100),
+		release: make(chan struct{}),
+		running: map[string]int{},
+		most:    map[string]int{},
+	}
+}
+
+func (s *syncer) Sync(ctx context.Context, job *sqq.Job[syncAccount]) error {
+	lane := job.Data.Account
+	s.mu.Lock()
+	s.running[lane]++
+	s.most[lane] = max(s.most[lane], s.running[lane])
+	s.mu.Unlock()
+	s.started <- job.Data
+	<-s.release
+	// Stay running briefly, so an overlapping job in the lane would be seen
+	time.Sleep(5 * time.Millisecond)
+	s.mu.Lock()
+	s.running[lane]--
+	s.mu.Unlock()
+	return nil
+}
+
+// mostRunning returns the most jobs that ran at once in the lane
+func (s *syncer) mostRunning(lane string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.most[lane]
+}
+
+func TestLane(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	path := file(t)
+	queues := dial(t, path)
+	db := database(t, path)
+	s := newSyncer()
+	queues.Queue(s.Sync).Concurrency(4)
+	for _, job := range []syncAccount{{"a", 1}, {"a", 2}, {"a", 3}, {"b", 1}} {
+		is.NoErr(queues.Push(ctx, job))
+	}
+	stop := start(t, queues)
+	// One job from each lane runs at once
+	lanes := []string{receive(t, s.started).Account, receive(t, s.started).Account}
+	slices.Sort(lanes)
+	is.Equal(lanes, []string{"a", "b"})
+	// The rest of lane a waits, even though workers are free
+	select {
+	case job := <-s.started:
+		t.Fatalf("%+v started while its lane was busy", job)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(s.release)
+	is.Equal(receive(t, s.started), syncAccount{"a", 2})
+	is.Equal(receive(t, s.started), syncAccount{"a", 3})
+	waitFor(t, db, "test.sync_account", "completed", 4)
+	stop()
+	is.Equal(s.mostRunning("a"), 1)
+}
+
+func TestLaneCompetingWorkers(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	path := file(t)
+	a := dial(t, path)
+	b := dial(t, path)
+	db := database(t, path)
+	s := newSyncer()
+	close(s.release)
+	a.Queue(s.Sync).Concurrency(4)
+	b.Queue(s.Sync).Concurrency(4)
+	lanes := []string{"a", "b", "c"}
+	for i := range 30 {
+		is.NoErr(a.Push(ctx, syncAccount{Account: lanes[i%3], N: i}))
+	}
+	stopA := start(t, a)
+	stopB := start(t, b)
+	waitFor(t, db, "test.sync_account", "completed", 30)
+	stopA()
+	stopB()
+	for _, lane := range lanes {
+		is.Equal(s.mostRunning(lane), 1)
+	}
+}
+
+func TestLaneReclaim(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	path := file(t)
+	queues := dial(t, path)
+	db := database(t, path)
+	s := newSyncer()
+	close(s.release)
+	queues.Queue(s.Sync).Concurrency(2).Retries(1)
+	crashed(t, db, syncAccount{Account: "a", N: 1}, 1)
+	is.NoErr(queues.Push(ctx, syncAccount{Account: "a", N: 2}))
+	stop := start(t, queues)
+	// The crashed job is reclaimed before the rest of its lane runs
+	is.Equal(receive(t, s.started).N, 1)
+	is.Equal(receive(t, s.started).N, 2)
+	waitFor(t, db, "test.sync_account", "completed", 2)
+	stop()
+	is.Equal(s.mostRunning("a"), 1)
+}
+
+// v003Schema is the jobs table from before lanes
+const v003Schema = `
+CREATE TABLE sqq_jobs (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	queue        TEXT    NOT NULL,
+	payload      TEXT    NOT NULL,
+	state        TEXT    NOT NULL DEFAULT 'pending',
+	attempts     INTEGER NOT NULL DEFAULT 0,
+	max_retries  INTEGER NOT NULL DEFAULT 0,
+	last_error   TEXT,
+	run_at       INTEGER NOT NULL,
+	locked_until INTEGER,
+	created_at   INTEGER NOT NULL,
+	updated_at   INTEGER NOT NULL
+);
+`
+
+func TestLaneMigrate(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	path := file(t)
+	db := database(t, path)
+	_, err := db.ExecContext(ctx, v003Schema)
+	is.NoErr(err)
+	queues := dial(t, path)
+	s := newSyncer()
+	close(s.release)
+	queues.Queue(s.Sync)
+	is.NoErr(queues.Push(ctx, syncAccount{Account: "a", N: 1}))
+	stop := start(t, queues)
+	waitFor(t, db, "test.sync_account", "completed", 1)
+	stop()
+	var lane string
+	is.NoErr(db.QueryRowContext(ctx, `SELECT lane FROM sqq_jobs WHERE queue = 'test.sync_account'`).Scan(&lane))
+	is.Equal(lane, "a")
 }
 
 type RunSession struct {

@@ -13,6 +13,7 @@ Dead-simple job queue for Go. Supports:
 - Push from any process: `queues.Push(ctx, RunSession{...})`
 - Per-queue concurrency, retries with backoff, and timeouts
 - Dead-letter queues with support for `Revive` and `Stats`
+- Lanes run related jobs one at a time (`pgq` and `sqq`)
 
 ## Install
 
@@ -94,6 +95,19 @@ func main() {
 }
 ```
 
+## Lanes
+
+Jobs in the same lane never run at the same time, even across processes. Add a `Lane` method to the payload:
+
+```go
+// Lane runs a session's jobs one at a time
+func (r Run) Lane() string {
+	return r.SessionID
+}
+```
+
+Jobs in different lanes, and jobs without a lane, run concurrently up to each queue's concurrency. Jobs usually run in the order they were pushed, but a job waiting to retry doesn't hold up the rest of its lane. Lanes are supported by `pgq` and `sqq`.
+
 ## Backends
 
 Every backend has the same API. Switching changes the import and `Dial`:
@@ -107,18 +121,19 @@ Every backend has the same API. Switching changes the import and `Dial`:
 
 ## API Reference
 
-| Method                            | Description                                         |
-| --------------------------------- | --------------------------------------------------- |
-| `queues.Queue(handler)`           | Register a handler for its payload's queue          |
-| `config.Concurrency(n)`           | Jobs this process runs at once (default 1)          |
-| `config.Retries(n)`               | Retries after a failure (default 0). Not on `sqs`.  |
-| `config.Timeout(d)`               | Cancel the handler after `d` (default none)         |
-| `queues.Push(ctx, payload)`       | Enqueue onto `payload.Queue()`                      |
-| `queues.PushTx(ctx, tx, payload)` | Enqueue inside a transaction (`pgq` and `sqq` only) |
-| `queues.Start(ctx)`               | Process registered queues until `ctx` is cancelled  |
-| `queues.Revive(ctx, queue)`       | Move dead-lettered jobs back onto the queue         |
-| `queues.Stats(ctx, queue)`        | Pending, running and failed counts                  |
-| `Permanent(err)`                  | Fail without retrying                               |
+| Method                            | Description                                                    |
+| --------------------------------- | -------------------------------------------------------------- |
+| `queues.Queue(handler)`           | Register a handler for its payload's queue                     |
+| `config.Concurrency(n)`           | Jobs this process runs at once (default 1)                     |
+| `config.Retries(n)`               | Retries after a failure (default 0). Not on `sqs`.             |
+| `config.Timeout(d)`               | Cancel the handler after `d` (default none)                    |
+| `queues.Push(ctx, payload)`       | Enqueue onto `payload.Queue()`                                 |
+| `queues.PushTx(ctx, tx, payload)` | Enqueue inside a transaction (`pgq` and `sqq` only)            |
+| `payload.Lane()`                  | Run jobs in the same lane one at a time (`pgq` and `sqq` only) |
+| `queues.Start(ctx)`               | Process registered queues until `ctx` is cancelled             |
+| `queues.Revive(ctx, queue)`       | Move dead-lettered jobs back onto the queue                    |
+| `queues.Stats(ctx, queue)`        | Pending, running and failed counts                             |
+| `Permanent(err)`                  | Fail without retrying                                          |
 
 Jobs are delivered **at least once**, so make handlers idempotent. Returning an error retries the job after 1s, 2s, 4s… up to 15 minutes. Once retries run out, or the error is `Permanent`, the job is dead-lettered.
 

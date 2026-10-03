@@ -20,6 +20,13 @@ type Job[T Payload] = jobq.Job[T]
 type Handler[T Payload] = jobq.Handler[T]
 type Stats = jobq.Stats
 
+// Laned is implemented by payloads that run one at a time per lane. Jobs in
+// the same lane never run at the same time, even across processes. Jobs in
+// different lanes, and jobs without a lane, run concurrently. Jobs usually run
+// in the order they were pushed, but a job waiting to retry doesn't hold up
+// the rest of its lane.
+type Laned = sqlq.Laned
+
 // Config configures how a registered queue is consumed
 type Config struct {
 	config *sqlq.Config
@@ -56,6 +63,7 @@ CREATE TABLE IF NOT EXISTS sqq_jobs (
 	id           INTEGER PRIMARY KEY AUTOINCREMENT,
 	queue        TEXT    NOT NULL,
 	payload      TEXT    NOT NULL,
+	lane         TEXT,
 	state        TEXT    NOT NULL DEFAULT 'pending',
 	attempts     INTEGER NOT NULL DEFAULT 0,
 	max_retries  INTEGER NOT NULL DEFAULT 0,
@@ -69,6 +77,12 @@ CREATE INDEX IF NOT EXISTS sqq_jobs_pending ON sqq_jobs (queue, run_at, id) WHER
 CREATE INDEX IF NOT EXISTS sqq_jobs_running ON sqq_jobs (queue, locked_until) WHERE state = 'running';
 `
 
+// laneIndex allows one running job per lane. It's created after migrating
+// tables from before lanes (v0.0.3 and earlier), which don't have the column.
+const laneIndex = `
+CREATE UNIQUE INDEX IF NOT EXISTS sqq_jobs_lane ON sqq_jobs (queue, lane) WHERE state = 'running' AND lane IS NOT NULL;
+`
+
 // Dial opens the SQLite database at path (a file path or file: URI) and
 // creates the jobs table if needed. Processes sharing the database must run
 // on the same host, and the file must not be on a network filesystem.
@@ -80,9 +94,9 @@ func Dial(ctx context.Context, log *slog.Logger, path string) (*Queues, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqq: unable to open %q: %w", path, err)
 	}
-	if _, err := db.ExecContext(ctx, schema); err != nil {
+	if err := migrate(ctx, db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("sqq: unable to create schema: %w", err)
+		return nil, err
 	}
 	log = log.With("package", "sqq")
 	return &Queues{
@@ -90,6 +104,36 @@ func Dial(ctx context.Context, log *slog.Logger, path string) (*Queues, error) {
 		log:  log,
 		sqlq: sqlq.New("sqq", &store{db}, log, 500*time.Millisecond),
 	}, nil
+}
+
+// migrate creates the jobs table, or updates one from an older version.
+// SQLite can't add a column only if it's missing, so this checks first, in a
+// transaction so concurrent Dials don't both add it.
+func migrate(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqq: unable to create schema: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("sqq: unable to create schema: %w", err)
+	}
+	var hasLane bool
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) > 0 FROM pragma_table_info('sqq_jobs') WHERE name = 'lane'`).Scan(&hasLane); err != nil {
+		return fmt.Errorf("sqq: unable to inspect schema: %w", err)
+	}
+	if !hasLane {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE sqq_jobs ADD COLUMN lane TEXT`); err != nil {
+			return fmt.Errorf("sqq: unable to add lanes: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, laneIndex); err != nil {
+		return fmt.Errorf("sqq: unable to create schema: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqq: unable to create schema: %w", err)
+	}
+	return nil
 }
 
 // dsn configures each connection for concurrent use: WAL so readers don't
@@ -148,8 +192,8 @@ func insert(ctx context.Context, db execer, payload Payload) error {
 	}
 	now := time.Now().UnixMilli()
 	if _, err := db.ExecContext(ctx, `
-		INSERT INTO sqq_jobs (queue, payload, run_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?3, ?3)
-	`, queue, string(data), now); err != nil {
+		INSERT INTO sqq_jobs (queue, payload, lane, run_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4, ?4)
+	`, queue, string(data), sqlq.Lane(payload), now); err != nil {
 		return fmt.Errorf("sqq: unable to push to %q: %w", queue, err)
 	}
 	return nil
@@ -213,8 +257,8 @@ func (q *Queues) Close() error {
 
 // store implements sqlq.Store for SQLite. SQLite runs one writer at a
 // time and a write statement takes the write lock before it reads, so a
-// single UPDATE can't hand the same job to two workers, even across
-// processes.
+// single UPDATE can't hand the same job, or two jobs in the same lane, to two
+// workers, even across processes.
 type store struct {
 	db *sql.DB
 }
@@ -233,11 +277,15 @@ func (s *store) Claim(ctx context.Context, queue string, retries int, lease time
 			locked_until = ?3,
 			updated_at = ?4
 		WHERE id = (
-			SELECT id FROM sqq_jobs
+			SELECT id FROM sqq_jobs j
 			WHERE queue = ?1 AND (
 				(state = 'pending' AND run_at <= ?4) OR
 				(state = 'running' AND locked_until < ?4)
-			)
+			) AND (lane IS NULL OR NOT EXISTS (
+				-- Includes expired jobs, so they're reclaimed before the rest of their lane
+				SELECT 1 FROM sqq_jobs r
+				WHERE r.queue = j.queue AND r.lane = j.lane AND r.state = 'running' AND r.id <> j.id
+			))
 			ORDER BY run_at, id
 			LIMIT 1
 		)
