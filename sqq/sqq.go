@@ -23,8 +23,8 @@ type Stats = jobq.Stats
 // Laned is implemented by payloads that run one at a time per lane. Jobs in
 // the same lane never run at the same time, even across processes. Jobs in
 // different lanes, and jobs without a lane, run concurrently. Jobs usually run
-// in the order they were pushed, but a job waiting to retry doesn't hold up
-// the rest of its lane.
+// in the order they were pushed, but a delayed job or one waiting to retry
+// doesn't hold up the rest of its lane.
 type Laned = sqlq.Laned
 
 // Config configures how a registered queue is consumed
@@ -163,25 +163,53 @@ func (q *Queues) Queue[T Payload](handler Handler[T]) *Config {
 
 // Push enqueues the payload onto the queue it names
 func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
-	if err := insert(ctx, q.db, payload); err != nil {
+	return q.push(ctx, payload, 0)
+}
+
+// PushIn enqueues the payload to run once delay has passed
+func (q *Queues) PushIn[T Payload](ctx context.Context, delay time.Duration, payload T) error {
+	return q.push(ctx, payload, delay)
+}
+
+// PushAt enqueues the payload to run at t, or right away if t has passed
+func (q *Queues) PushAt[T Payload](ctx context.Context, t time.Time, payload T) error {
+	return q.push(ctx, payload, time.Until(t))
+}
+
+func (q *Queues) push(ctx context.Context, payload Payload, delay time.Duration) error {
+	if err := insert(ctx, q.db, payload, delay); err != nil {
 		return err
 	}
 	// SQLite can't notify other processes, but this process's idle workers
-	// can start right away. Other processes find the job when they poll.
+	// can start right away, or wait for a delayed job. Other processes find
+	// the job when they poll.
 	q.sqlq.Notify(payload.Queue())
 	return nil
 }
 
 // PushTx enqueues the payload within tx, so the job only exists if tx commits
 func (q *Queues) PushTx[T Payload](ctx context.Context, tx *sql.Tx, payload T) error {
-	return insert(ctx, tx, payload)
+	return insert(ctx, tx, payload, 0)
+}
+
+// PushTxIn enqueues the payload within tx to run once delay has passed
+func (q *Queues) PushTxIn[T Payload](ctx context.Context, tx *sql.Tx, delay time.Duration, payload T) error {
+	return insert(ctx, tx, payload, delay)
+}
+
+// PushTxAt enqueues the payload within tx to run at t, or right away if t has
+// passed
+func (q *Queues) PushTxAt[T Payload](ctx context.Context, tx *sql.Tx, t time.Time, payload T) error {
+	return insert(ctx, tx, payload, time.Until(t))
 }
 
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func insert(ctx context.Context, db execer, payload Payload) error {
+// insert adds a job that runs after delay. A delay that has passed runs now
+// rather than ahead of earlier jobs.
+func insert(ctx context.Context, db execer, payload Payload, delay time.Duration) error {
 	queue := payload.Queue()
 	if queue == "" {
 		return fmt.Errorf("sqq: %T has an empty queue name", payload)
@@ -190,10 +218,10 @@ func insert(ctx context.Context, db execer, payload Payload) error {
 	if err != nil {
 		return fmt.Errorf("sqq: unable to encode %q payload: %w", queue, err)
 	}
-	now := time.Now().UnixMilli()
+	now := time.Now()
 	if _, err := db.ExecContext(ctx, `
-		INSERT INTO sqq_jobs (queue, payload, lane, run_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4, ?4)
-	`, queue, string(data), sqlq.Lane(payload), now); err != nil {
+		INSERT INTO sqq_jobs (queue, payload, lane, run_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+	`, queue, string(data), sqlq.Lane(payload), now.Add(max(delay, 0)).UnixMilli(), now.UnixMilli()); err != nil {
 		return fmt.Errorf("sqq: unable to push to %q: %w", queue, err)
 	}
 	return nil
@@ -298,6 +326,20 @@ func (s *store) Claim(ctx context.Context, queue string, retries int, lease time
 	}
 	j.CreatedAt = time.UnixMilli(createdAt)
 	return j, nil
+}
+
+func (s *store) Next(ctx context.Context, queue string) (time.Duration, error) {
+	now := time.Now().UnixMilli()
+	var next sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT min(run_at) FROM sqq_jobs WHERE queue = ?1 AND state = 'pending' AND run_at > ?2
+	`, queue, now).Scan(&next)
+	if err != nil {
+		return 0, fmt.Errorf("sqq: unable to find the next job in %q: %w", queue, err)
+	} else if !next.Valid {
+		return 0, nil
+	}
+	return time.Duration(next.Int64-now) * time.Millisecond, nil
 }
 
 func (s *store) Extend(ctx context.Context, j *sqlq.Job, lease time.Duration) error {

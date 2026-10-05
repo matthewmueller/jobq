@@ -942,3 +942,116 @@ func ExampleConfig_Retries() {
 	// attempt 2 failed
 	// attempt 3 sent to alice@example.com
 }
+
+func TestPushIn(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	path := file(t)
+	queues := dial(t, path)
+	db := database(t, path)
+	u := &users{jobs: make(chan *sqq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	pushed := time.Now()
+	is.NoErr(queues.PushIn(ctx, time.Second, createUser{Name: "alice"}))
+	select {
+	case <-u.jobs:
+		t.Fatal("delayed job ran early")
+	case <-time.After(500 * time.Millisecond):
+	}
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	is.True(time.Since(pushed) >= time.Second)
+	waitFor(t, db, "test.create_user", "completed", 1)
+	stop()
+}
+
+func TestPushAt(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t, file(t))
+	u := &users{jobs: make(chan *sqq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	at := time.Now().Add(time.Second)
+	is.NoErr(queues.PushAt(ctx, at, createUser{Name: "alice"}))
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	is.True(!time.Now().Before(at))
+	// A time that has passed runs right away
+	pushed := time.Now()
+	is.NoErr(queues.PushAt(ctx, pushed.Add(-time.Hour), createUser{Name: "bob"}))
+	is.Equal(receive(t, u.jobs).Data.Name, "bob")
+	is.True(time.Since(pushed) < 250*time.Millisecond)
+	stop()
+}
+
+func TestPushTxIn(t *testing.T) {
+	is := is.New(t)
+	path := file(t)
+	ctx := context.Background()
+	queues := dial(t, path)
+	db := database(t, path)
+	// Rolled back, so never enqueued
+	tx, err := db.BeginTx(ctx, nil)
+	is.NoErr(err)
+	is.NoErr(queues.PushTxIn(ctx, tx, time.Second, createUser{Name: "mallory"}))
+	is.NoErr(tx.Rollback())
+	// Committed
+	tx, err = db.BeginTx(ctx, nil)
+	is.NoErr(err)
+	pushed := time.Now()
+	is.NoErr(queues.PushTxIn(ctx, tx, time.Second, createUser{Name: "carol"}))
+	is.NoErr(queues.PushTxAt(ctx, tx, pushed.Add(time.Second), createUser{Name: "dave"}))
+	is.NoErr(tx.Commit())
+	u := &users{jobs: make(chan *sqq.Job[createUser], 2)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	names := []string{receive(t, u.jobs).Data.Name, receive(t, u.jobs).Data.Name}
+	slices.Sort(names)
+	is.Equal(names, []string{"carol", "dave"})
+	is.True(time.Since(pushed) >= time.Second)
+	waitFor(t, db, "test.create_user", "completed", 2)
+	stop()
+}
+
+func TestDelayedStats(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t, file(t))
+	is.NoErr(queues.PushIn(ctx, time.Hour, createUser{Name: "alice"}))
+	stats, err := queues.Stats(ctx, "test.create_user")
+	is.NoErr(err)
+	is.Equal(stats, &sqq.Stats{Pending: 1})
+}
+
+func TestDelayedOtherProcess(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	path := file(t)
+	producer := dial(t, path)
+	consumer := dial(t, path)
+	u := &users{jobs: make(chan *sqq.Job[createUser], 1)}
+	consumer.Queue(u.Create)
+	stop := start(t, consumer)
+	// The consumer isn't notified, so it finds the job when it polls and then
+	// waits until it's due rather than for the next poll
+	is.NoErr(producer.PushIn(ctx, time.Second, createUser{Name: "alice"}))
+	due := time.Now().Add(time.Second)
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	is.True(time.Since(due) < 250*time.Millisecond)
+	stop()
+}
+
+func TestDelayedLane(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t, file(t))
+	s := newSyncer()
+	close(s.release)
+	queues.Queue(s.Sync)
+	is.NoErr(queues.PushIn(ctx, time.Hour, syncAccount{"a", 1}))
+	is.NoErr(queues.Push(ctx, syncAccount{"a", 2}))
+	stop := start(t, queues)
+	// The delayed job doesn't hold up the rest of its lane
+	is.Equal(receive(t, s.started), syncAccount{"a", 2})
+	stop()
+}

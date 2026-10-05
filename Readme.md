@@ -11,6 +11,7 @@ Dead-simple job queue for Go. Supports:
 
 - Payload typed and inferred from their handlers: `queues.Queue(session.Run)`
 - Push from any process: `queues.Push(ctx, RunSession{...})`
+- Delay jobs: `queues.PushIn(ctx, time.Hour, RunSession{...})`
 - Per-queue concurrency, retries with backoff, and timeouts
 - Dead-letter queues with support for `Revive` and `Stats`
 - Lanes run related jobs one at a time (`pgq` and `sqq`)
@@ -106,7 +107,21 @@ func (r Run) Lane() string {
 }
 ```
 
-Jobs in different lanes, and jobs without a lane, run concurrently up to each queue's concurrency. Jobs usually run in the order they were pushed, but a job waiting to retry doesn't hold up the rest of its lane. Lanes are supported by `pgq` and `sqq`.
+Jobs in different lanes, and jobs without a lane, run concurrently up to each queue's concurrency. Jobs usually run in the order they were pushed, but a delayed job or one waiting to retry doesn't hold up the rest of its lane. Lanes are supported by `pgq` and `sqq`.
+
+## Delayed Jobs
+
+Push a job to run later with `PushIn` or `PushAt`:
+
+```go
+// Run in an hour
+queues.PushIn(ctx, time.Hour, Run{SessionID: "123"})
+
+// Run tomorrow at 9am, or right away if that time has passed
+queues.PushAt(ctx, tomorrow9am, Run{SessionID: "123"})
+```
+
+Delayed jobs count as pending in `Stats`. `pgq` and `sqq` also have `PushTxIn` and `PushTxAt`. On `jetq` and `sqs`, delays are rounded up to the second.
 
 ## Backends
 
@@ -128,7 +143,10 @@ Every backend has the same API. Switching changes the import and `Dial`:
 | `config.Retries(n)`               | Retries after a failure (default 0). Not on `sqs`.             |
 | `config.Timeout(d)`               | Cancel the handler after `d` (default none)                    |
 | `queues.Push(ctx, payload)`       | Enqueue onto `payload.Queue()`                                 |
+| `queues.PushIn(ctx, d, payload)`  | Enqueue to run after `d`. Up to 15 minutes on `sqs`.           |
+| `queues.PushAt(ctx, t, payload)`  | Enqueue to run at `t`. Up to 15 minutes ahead on `sqs`.        |
 | `queues.PushTx(ctx, tx, payload)` | Enqueue inside a transaction (`pgq` and `sqq` only)            |
+| `queues.PushTxIn/PushTxAt(...)`   | Delayed `PushTx` (`pgq` and `sqq` only)                        |
 | `payload.Lane()`                  | Run jobs in the same lane one at a time (`pgq` and `sqq` only) |
 | `queues.Start(ctx)`               | Process registered queues until `ctx` is cancelled             |
 | `queues.Revive(ctx, queue)`       | Move dead-lettered jobs back onto the queue                    |
@@ -141,8 +159,8 @@ Jobs are delivered **at least once**, so make handlers idempotent. Returning an 
 
 - **PostgreSQL:** completed jobs stay in `pgq_jobs`, so delete them periodically. `LISTEN` uses one extra connection per process running workers, which must be direct or session-pooled (PgBouncer's transaction pooling doesn't support it).
 - **SQLite:** other processes find new jobs by polling every 500ms. Don't put the file on a network filesystem.
-- **NATS JetStream:** queue names are dot-separated tokens. A delivery interrupted by a shutdown or crash counts as an attempt.
-- **SQS:** queue names may only use letters, numbers, hyphens and underscores. Each queue needs a dead-letter queue and permissions; see [docs/sqs.md](docs/sqs.md) for Terraform that sets them up.
+- **NATS JetStream:** queue names are dot-separated tokens. A delivery interrupted by a shutdown or crash counts as an attempt. Delayed jobs need NATS server 2.12+.
+- **SQS:** queue names may only use letters, numbers, hyphens and underscores. Delays are limited to 15 minutes. Each queue needs a dead-letter queue and permissions; see [docs/sqs.md](docs/sqs.md) for Terraform that sets them up.
 
 ## Development
 

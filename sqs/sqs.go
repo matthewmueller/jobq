@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -141,9 +142,28 @@ func (q *Queues) Queue[T Payload](handler Handler[T]) *Config {
 
 // Push enqueues the payload onto the queue it names
 func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
+	return q.push(ctx, payload, 0)
+}
+
+// PushIn enqueues the payload to run once delay has passed. SQS limits delays
+// to 15 minutes and rounds them up to the second.
+func (q *Queues) PushIn[T Payload](ctx context.Context, delay time.Duration, payload T) error {
+	return q.push(ctx, payload, delay)
+}
+
+// PushAt enqueues the payload to run at t, or right away if t has passed. SQS
+// limits delays to 15 minutes and rounds them up to the second.
+func (q *Queues) PushAt[T Payload](ctx context.Context, t time.Time, payload T) error {
+	return q.push(ctx, payload, time.Until(t))
+}
+
+func (q *Queues) push(ctx context.Context, payload Payload, delay time.Duration) error {
 	queue := payload.Queue()
 	if err := validate(queue); err != nil {
 		return err
+	}
+	if delay > 15*time.Minute {
+		return fmt.Errorf("sqs: delays are limited to 15 minutes, got %s", delay)
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -152,6 +172,8 @@ func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
 	if _, err := q.client.SendMessage(ctx, &awssqs.SendMessageInput{
 		QueueUrl:    aws.String(q.queueURL(queue)),
 		MessageBody: aws.String(string(data)),
+		// Round up so the job never runs early
+		DelaySeconds: int32(math.Ceil(max(delay, 0).Seconds())),
 	}); err != nil {
 		return fmt.Errorf("sqs: unable to push to %q: %w", queue, err)
 	}

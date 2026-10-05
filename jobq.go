@@ -50,7 +50,7 @@ func (e *permanentError) Unwrap() error { return e.err }
 // Stats summarizes a queue. Counts may be approximate depending on the
 // backend.
 type Stats struct {
-	Pending int // waiting to run, including delayed retries
+	Pending int // waiting to run, including delayed jobs and retries
 	Running int // currently claimed by a worker
 	Failed  int // in the dead-letter queue
 }

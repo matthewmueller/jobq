@@ -606,3 +606,77 @@ func Example() {
 		panic(err)
 	}
 }
+
+func TestPushIn(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t, serve(t))
+	u := &users{jobs: make(chan *jetq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	pushed := time.Now()
+	is.NoErr(queues.PushIn(ctx, time.Second, createUser{Name: "alice"}))
+	select {
+	case <-u.jobs:
+		t.Fatal("delayed job ran early")
+	case <-time.After(500 * time.Millisecond):
+	}
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	is.True(time.Since(pushed) >= time.Second)
+	stop()
+}
+
+func TestPushAt(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t, serve(t))
+	u := &users{jobs: make(chan *jetq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	at := time.Now().Add(time.Second)
+	is.NoErr(queues.PushAt(ctx, at, createUser{Name: "alice"}))
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	is.True(!time.Now().Before(at))
+	// A time that has passed runs right away
+	pushed := time.Now()
+	is.NoErr(queues.PushAt(ctx, pushed.Add(-time.Hour), createUser{Name: "bob"}))
+	is.Equal(receive(t, u.jobs).Data.Name, "bob")
+	is.True(time.Since(pushed) < time.Second)
+	stop()
+}
+
+func TestDelayedStats(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t, serve(t))
+	u := &users{jobs: make(chan *jetq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	is.NoErr(queues.PushIn(ctx, time.Second, createUser{Name: "alice"}))
+	waitFor(t, queues, "test.create_user", jetq.Stats{Pending: 1})
+	stop := start(t, queues)
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	// The schedule is removed once it fires
+	waitFor(t, queues, "test.create_user", jetq.Stats{})
+	stop()
+}
+
+func TestDelayedUpgrade(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	url := serve(t)
+	// The stream as created by v0.0.4 and earlier
+	_, err := client(t, url).CreateStream(ctx, jetstream.StreamConfig{
+		Name:      "JOBQ",
+		Subjects:  []string{"jobq.jobs.>"},
+		Retention: jetstream.WorkQueuePolicy,
+		Storage:   jetstream.FileStorage,
+	})
+	is.NoErr(err)
+	queues := dial(t, url)
+	u := &users{jobs: make(chan *jetq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	is.NoErr(queues.PushIn(ctx, time.Second, createUser{Name: "alice"}))
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	stop()
+}
