@@ -25,8 +25,8 @@ type Stats = jobq.Stats
 // Laned is implemented by payloads that run one at a time per lane. Jobs in
 // the same lane never run at the same time, even across processes. Jobs in
 // different lanes, and jobs without a lane, run concurrently. Jobs usually run
-// in the order they were pushed, but a job waiting to retry doesn't hold up
-// the rest of its lane.
+// in the order they were pushed, but a delayed job or one waiting to retry
+// doesn't hold up the rest of its lane.
 type Laned = sqlq.Laned
 
 // Config configures how a registered queue is consumed
@@ -130,19 +130,42 @@ func (q *Queues) Queue[T Payload](handler Handler[T]) *Config {
 
 // Push enqueues the payload onto the queue it names
 func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
-	return insert(ctx, q.pool, payload)
+	return insert(ctx, q.pool, payload, 0)
+}
+
+// PushIn enqueues the payload to run once delay has passed
+func (q *Queues) PushIn[T Payload](ctx context.Context, delay time.Duration, payload T) error {
+	return insert(ctx, q.pool, payload, delay)
+}
+
+// PushAt enqueues the payload to run at t, or right away if t has passed
+func (q *Queues) PushAt[T Payload](ctx context.Context, t time.Time, payload T) error {
+	return insert(ctx, q.pool, payload, time.Until(t))
 }
 
 // PushTx enqueues the payload within tx, so the job only exists if tx commits
 func (q *Queues) PushTx[T Payload](ctx context.Context, tx pgx.Tx, payload T) error {
-	return insert(ctx, tx, payload)
+	return insert(ctx, tx, payload, 0)
+}
+
+// PushTxIn enqueues the payload within tx to run once delay has passed
+func (q *Queues) PushTxIn[T Payload](ctx context.Context, tx pgx.Tx, delay time.Duration, payload T) error {
+	return insert(ctx, tx, payload, delay)
+}
+
+// PushTxAt enqueues the payload within tx to run at t, or right away if t has
+// passed
+func (q *Queues) PushTxAt[T Payload](ctx context.Context, tx pgx.Tx, t time.Time, payload T) error {
+	return insert(ctx, tx, payload, time.Until(t))
 }
 
 type execer interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
-func insert(ctx context.Context, db execer, payload Payload) error {
+// insert adds a job that runs after delay, measured by the database's clock.
+// A delay that has passed runs now rather than ahead of earlier jobs.
+func insert(ctx context.Context, db execer, payload Payload, delay time.Duration) error {
 	queue := payload.Queue()
 	if queue == "" {
 		return fmt.Errorf("pgq: %T has an empty queue name", payload)
@@ -151,7 +174,9 @@ func insert(ctx context.Context, db execer, payload Payload) error {
 	if err != nil {
 		return fmt.Errorf("pgq: unable to encode %q payload: %w", queue, err)
 	}
-	if _, err := db.Exec(ctx, `INSERT INTO pgq_jobs (queue, payload, lane) VALUES ($1, $2, $3)`, queue, data, sqlq.Lane(payload)); err != nil {
+	if _, err := db.Exec(ctx, `
+		INSERT INTO pgq_jobs (queue, payload, lane, run_at) VALUES ($1, $2, $3, now() + $4 * interval '1 millisecond')
+	`, queue, data, sqlq.Lane(payload), max(delay, 0).Milliseconds()); err != nil {
 		return fmt.Errorf("pgq: unable to push to %q: %w", queue, err)
 	}
 	return nil
@@ -317,6 +342,20 @@ func (s *store) claim(ctx context.Context, queue string, retries int, lease time
 		return nil, fmt.Errorf("pgq: unable to claim from %q: %w", queue, err)
 	}
 	return j, nil
+}
+
+func (s *store) Next(ctx context.Context, queue string) (time.Duration, error) {
+	var ms *int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT ceil(extract(epoch FROM min(run_at) - now()) * 1000)::bigint
+		FROM pgq_jobs WHERE queue = $1 AND state = 'pending' AND run_at > now()
+	`, queue).Scan(&ms)
+	if err != nil {
+		return 0, fmt.Errorf("pgq: unable to find the next job in %q: %w", queue, err)
+	} else if ms == nil {
+		return 0, nil
+	}
+	return time.Duration(*ms) * time.Millisecond, nil
 }
 
 func (s *store) Extend(ctx context.Context, j *sqlq.Job, lease time.Duration) error {

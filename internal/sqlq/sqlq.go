@@ -25,6 +25,10 @@ type Store interface {
 	// are none. Jobs whose lease expired (e.g. their worker crashed) are
 	// reclaimed.
 	Claim(ctx context.Context, queue string, retries int, lease time.Duration) (*Job, error)
+	// Next returns how long until the queue's next delayed job is due, or 0
+	// if no pending jobs are waiting on their run time. It's measured by the
+	// store's clock, which decides when jobs are due.
+	Next(ctx context.Context, queue string) (time.Duration, error)
 	// Extend renews a running job's lease
 	Extend(ctx context.Context, job *Job, lease time.Duration) error
 	// Complete marks the job as done
@@ -40,8 +44,8 @@ type Store interface {
 // Laned is implemented by payloads that run one at a time per lane. Jobs in
 // the same lane never run at the same time, even across processes. Jobs in
 // different lanes, and jobs without a lane, run concurrently. Jobs usually run
-// in the order they were pushed, but a job waiting to retry doesn't hold up
-// the rest of its lane.
+// in the order they were pushed, but a delayed job or one waiting to retry
+// doesn't hold up the rest of its lane.
 type Laned interface {
 	Lane() string
 }
@@ -219,11 +223,16 @@ func (w *Worker) validate() error {
 func (w *Worker) work(ctx context.Context, c *Config) {
 	failures := 0
 	for ctx.Err() == nil {
+		var next time.Duration
 		j, err := w.store.Claim(ctx, c.queue, c.retries, w.lease)
 		if err == nil && j != nil {
 			// There may be more jobs, so get another worker checking too
 			c.signal()
 			err = w.run(ctx, c, j)
+		} else if err == nil {
+			// Wake when the next delayed job is due rather than at the next poll,
+			// since it may have been pushed by another process
+			next, err = w.store.Next(ctx, c.queue)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -236,14 +245,18 @@ func (w *Worker) work(ctx context.Context, c *Config) {
 		}
 		failures = 0
 		if j == nil {
-			idle(ctx, c, w.poll)
+			wait := w.poll
+			if next > 0 {
+				wait = min(wait, next)
+			}
+			idle(ctx, c, wait)
 		}
 	}
 }
 
-// idle waits until the queue is signaled, poll elapses or ctx is cancelled
-func idle(ctx context.Context, c *Config, poll time.Duration) {
-	timer := time.NewTimer(poll)
+// idle waits until the queue is signaled, d elapses or ctx is cancelled
+func idle(ctx context.Context, c *Config, d time.Duration) {
+	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

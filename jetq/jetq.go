@@ -16,6 +16,7 @@ import (
 	"github.com/matthewmueller/jobq/internal/backoff"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/nats-io/nuid"
 )
 
 type Payload = jobq.Payload
@@ -37,12 +38,18 @@ const (
 func jobsSubject(queue string) string { return "jobq.jobs." + queue }
 func deadSubject(queue string) string { return "jobq.dead." + queue }
 
+// delayedSubject holds a delayed job until NATS publishes it to the queue.
+// Each job gets its own subject, since a schedule replaces the previous
+// message on its subject.
+func delayedSubject(queue, id string) string { return "jobq.delayed." + queue + "." + id }
+
 // consumerName is the queue's durable consumer. Consumer names can't contain
 // dots, so they become underscores.
 func consumerName(queue string) string { return strings.ReplaceAll(queue, ".", "_") }
 
 // Dial connects to NATS and creates or updates the JOBQ and JOBQ_DEAD
 // streams. Each payload's queue is the subject jobq.jobs.<Payload.Queue()>.
+// Delayed jobs require NATS server 2.12 or later.
 func Dial(ctx context.Context, log *slog.Logger, url string) (*Queues, error) {
 	nc, err := nats.Connect(url, nats.Name("jobq"))
 	if err != nil {
@@ -53,12 +60,15 @@ func Dial(ctx context.Context, log *slog.Logger, url string) (*Queues, error) {
 		nc.Close()
 		return nil, fmt.Errorf("jetq: unable to use jetstream: %w", err)
 	}
-	// Work-queue retention deletes each message once it's acknowledged
+	// Work-queue retention deletes each message once it's acknowledged.
+	// Schedules publish delayed jobs when they're due, and require rollups.
 	jobs, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      jobsStream,
-		Subjects:  []string{jobsSubject(">")},
-		Retention: jetstream.WorkQueuePolicy,
-		Storage:   jetstream.FileStorage,
+		Name:              jobsStream,
+		Subjects:          []string{jobsSubject(">"), "jobq.delayed.>"},
+		Retention:         jetstream.WorkQueuePolicy,
+		Storage:           jetstream.FileStorage,
+		AllowMsgSchedules: true,
+		AllowRollup:       true,
 	})
 	if err != nil {
 		nc.Close()
@@ -162,6 +172,22 @@ func (q *Queues) Queue[T Payload](handler Handler[T]) *Config {
 
 // Push enqueues the payload onto the queue it names
 func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
+	return q.push(ctx, payload, 0)
+}
+
+// PushIn enqueues the payload to run once delay has passed. Delays are
+// rounded up to the second and require NATS server 2.12 or later.
+func (q *Queues) PushIn[T Payload](ctx context.Context, delay time.Duration, payload T) error {
+	return q.push(ctx, payload, delay)
+}
+
+// PushAt enqueues the payload to run at t, or right away if t has passed.
+// Delays are rounded up to the second and require NATS server 2.12 or later.
+func (q *Queues) PushAt[T Payload](ctx context.Context, t time.Time, payload T) error {
+	return q.push(ctx, payload, time.Until(t))
+}
+
+func (q *Queues) push(ctx context.Context, payload Payload, delay time.Duration) error {
 	queue := payload.Queue()
 	if err := validate(queue); err != nil {
 		return err
@@ -170,7 +196,23 @@ func (q *Queues) Push[T Payload](ctx context.Context, payload T) error {
 	if err != nil {
 		return fmt.Errorf("jetq: unable to encode %q payload: %w", queue, err)
 	}
-	if _, err := q.js.Publish(ctx, jobsSubject(queue), data); err != nil {
+	if delay <= 0 {
+		if _, err := q.js.Publish(ctx, jobsSubject(queue), data); err != nil {
+			return fmt.Errorf("jetq: unable to push to %q: %w", queue, err)
+		}
+		return nil
+	}
+	// Servers before 2.12 ignore the setting rather than rejecting it, and
+	// would hold the job forever
+	if !q.jobs.CachedInfo().Config.AllowMsgSchedules {
+		return fmt.Errorf("jetq: delayed jobs require NATS server 2.12 or later")
+	}
+	// Schedules are precise to the second, so round up rather than run early
+	at := time.Now().Add(delay + time.Second - 1).Truncate(time.Second)
+	if _, err := q.js.Publish(ctx, delayedSubject(queue, nuid.Next()), data,
+		jetstream.WithScheduleAt(at),
+		jetstream.WithScheduleTarget(jobsSubject(queue)),
+	); err != nil {
 		return fmt.Errorf("jetq: unable to push to %q: %w", queue, err)
 	}
 	return nil
@@ -219,14 +261,18 @@ func (q *Queues) Revive(ctx context.Context, queue string) error {
 	return nil
 }
 
-// Stats counts the queue's pending, running and dead-lettered jobs. Jobs
-// waiting out a retry backoff or released at shutdown count as running until
-// they're redelivered.
+// Stats counts the queue's pending, running and dead-lettered jobs. Delayed
+// jobs count as pending. Jobs waiting out a retry backoff or released at
+// shutdown count as running until they're redelivered.
 func (q *Queues) Stats(ctx context.Context, queue string) (*Stats, error) {
 	if err := validate(queue); err != nil {
 		return nil, err
 	}
 	total, err := count(ctx, q.jobs, jobsSubject(queue))
+	if err != nil {
+		return nil, err
+	}
+	delayed, err := count(ctx, q.jobs, delayedSubject(queue, "*"))
 	if err != nil {
 		return nil, err
 	}
@@ -246,19 +292,24 @@ func (q *Queues) Stats(ctx context.Context, queue string) (*Stats, error) {
 		return nil, fmt.Errorf("jetq: unable to get stats for %q: %w", queue, err)
 	}
 	return &Stats{
-		Pending: total - running,
+		Pending: total - running + delayed,
 		Running: running,
 		Failed:  failed,
 	}, nil
 }
 
-// count returns how many messages the stream holds for subject
-func count(ctx context.Context, stream jetstream.Stream, subject string) (int, error) {
-	info, err := stream.Info(ctx, jetstream.WithSubjectFilter(subject))
+// count returns how many messages the stream holds for the subjects matching
+// filter
+func count(ctx context.Context, stream jetstream.Stream, filter string) (int, error) {
+	info, err := stream.Info(ctx, jetstream.WithSubjectFilter(filter))
 	if err != nil {
-		return 0, fmt.Errorf("jetq: unable to count %s: %w", subject, err)
+		return 0, fmt.Errorf("jetq: unable to count %s: %w", filter, err)
 	}
-	return int(info.State.Subjects[subject]), nil
+	n := 0
+	for _, c := range info.State.Subjects {
+		n += int(c)
+	}
+	return n, nil
 }
 
 // Start processes jobs for all registered queues. It blocks until ctx is

@@ -637,3 +637,36 @@ func Example() {
 		panic(err)
 	}
 }
+
+func TestPushIn(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	queues := dial(t)
+	client := client(t)
+	u := &users{jobs: make(chan *sqs.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	stop := start(t, queues)
+	pushed := time.Now()
+	is.NoErr(queues.PushIn(ctx, 2*time.Second, createUser{Name: "alice"}))
+	is.Equal(receive(t, u.jobs).Data.Name, "alice")
+	stop()
+	is.True(time.Since(pushed) >= 2*time.Second)
+	is.Equal(len(drain(t, client, queueURL())), 0)
+}
+
+type remind struct{}
+
+func (remind) Queue() string { return "remind" }
+
+func TestPushInTooLong(t *testing.T) {
+	is := is.New(t)
+	// Rejected before calling AWS, so no queue or credentials are needed
+	queues, err := sqs.Dial(context.Background(), logger(t), "https://sqs.us-east-1.amazonaws.com/123456789012")
+	is.NoErr(err)
+	err = queues.PushIn(context.Background(), time.Hour, remind{})
+	is.True(err != nil)
+	is.Equal(err.Error(), "sqs: delays are limited to 15 minutes, got 1h0m0s")
+	err = queues.PushAt(context.Background(), time.Now().Add(time.Hour), remind{})
+	is.True(err != nil)
+	is.True(strings.HasPrefix(err.Error(), "sqs: delays are limited to 15 minutes"))
+}
