@@ -1,3 +1,7 @@
+# 0.0.5 / 2026-10-04
+
+- add delayed jobs with PushIn and PushAt
+
 # 0.0.4 / 2026-10-03
 
 - add support for adding lanes to the payload (sqlite and postgres only)
