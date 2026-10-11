@@ -193,6 +193,29 @@ func TestPushAndProcess(t *testing.T) {
 	stop()
 }
 
+func TestLoad(t *testing.T) {
+	is := is.New(t)
+	ctx := context.Background()
+	dial(t) // skips if the database is unavailable
+	pool, err := pgxpool.New(ctx, databaseURL())
+	is.NoErr(err)
+	t.Cleanup(pool.Close)
+	queues, err := pgq.Load(ctx, logger(t), pool)
+	is.NoErr(err)
+	db := database(t)
+	u := &users{jobs: make(chan *pgq.Job[createUser], 1)}
+	queues.Queue(u.Create)
+	is.NoErr(queues.Push(ctx, createUser{Name: "carol"}))
+	stop := start(t, queues)
+	job := receive(t, u.jobs)
+	is.Equal(job.Data.Name, "carol")
+	waitFor(t, db, "test.create_user", "completed", 1)
+	stop()
+	// Close leaves a pool passed to Load open
+	is.NoErr(queues.Close())
+	is.NoErr(pool.Ping(ctx))
+}
+
 func TestPushWithoutRegistration(t *testing.T) {
 	is := is.New(t)
 	ctx := context.Background()
@@ -879,6 +902,31 @@ func Example() {
 		panic(err)
 	}
 	// Output: running session 123
+}
+
+func ExampleLoad() {
+	ctx := context.Background()
+	// Share your app's pool, e.g. to push jobs in your own transactions
+	pool, err := pgxpool.New(ctx, databaseURL())
+	if err != nil {
+		panic(err)
+	}
+	defer pool.Close()
+	queues, err := pgq.Load(ctx, slog.Default(), pool)
+	if err != nil {
+		panic(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		panic(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := queues.PushTx(ctx, tx, RunSession{SessionID: "789"}); err != nil {
+		panic(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		panic(err)
+	}
 }
 
 func ExampleQueues_Push() {

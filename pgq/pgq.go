@@ -96,30 +96,58 @@ CREATE OR REPLACE TRIGGER pgq_jobs_notify
 	EXECUTE FUNCTION pgq_notify();
 `
 
-// Dial connects to PostgreSQL and creates the jobs table if needed
+// Dial connects to PostgreSQL and creates the jobs table if needed. Close the
+// queues to close the connections.
 func Dial(ctx context.Context, log *slog.Logger, url string) (*Queues, error) {
 	pool, err := pgxpool.New(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("pgq: unable to connect: %w", err)
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
+	queues, err := Load(ctx, log, pool)
+	if err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("pgq: unable to create schema: %w", err)
+		return nil, err
 	}
+	queues.closePool = true
+	return queues, nil
+}
+
+// Load queues on the pool and creates the jobs table if needed
+func Load(ctx context.Context, log *slog.Logger, pool *pgxpool.Pool) (*Queues, error) {
+	queues := New(log, pool)
+	if err := queues.Migrate(ctx); err != nil {
+		return nil, err
+	}
+	return queues, nil
+}
+
+// New queues on the pool, without creating the jobs table. Call Migrate to
+// create it, e.g. alongside your own migrations.
+func New(log *slog.Logger, pool *pgxpool.Pool) *Queues {
 	log = log.With("package", "pgq")
 	return &Queues{
 		pool: pool,
 		log:  log,
 		// Notifications wake idle workers, so polling is only a fallback
 		sqlq: sqlq.New("pgq", &store{pool}, log, 5*time.Second),
-	}, nil
+	}
+}
+
+// Migrate creates the jobs table if it doesn't exist yet. It's safe to call
+// more than once, even from several processes at the same time.
+func (q *Queues) Migrate(ctx context.Context) error {
+	if _, err := q.pool.Exec(ctx, schema); err != nil {
+		return fmt.Errorf("pgq: unable to create schema: %w", err)
+	}
+	return nil
 }
 
 // Queues produces and consumes jobs backed by PostgreSQL
 type Queues struct {
-	pool *pgxpool.Pool
-	log  *slog.Logger
-	sqlq *sqlq.Worker
+	pool      *pgxpool.Pool
+	log       *slog.Logger
+	sqlq      *sqlq.Worker
+	closePool bool // true when Dial opened the pool
 }
 
 // Queue registers a handler for the queue named by T. Register handlers
@@ -226,7 +254,8 @@ func (q *Queues) Stats(ctx context.Context, queue string) (*Stats, error) {
 
 // Start processes jobs for all registered queues. It blocks until ctx is
 // cancelled and running handlers have returned. Database errors are logged
-// and retried rather than returned.
+// and retried rather than returned. Start opens one dedicated connection for
+// LISTEN, outside the pool and its MaxConns.
 func (q *Queues) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
@@ -253,7 +282,8 @@ func (q *Queues) listen(ctx context.Context) {
 }
 
 // listenOnce listens on a dedicated connection, since LISTEN is tied to the
-// session and pooled connections are shared
+// session and pooled connections are shared. Holding a pooled connection
+// instead would starve workers on a small pool.
 func (q *Queues) listenOnce(ctx context.Context) error {
 	conn, err := pgx.ConnectConfig(ctx, q.pool.Config().ConnConfig)
 	if err != nil {
@@ -284,9 +314,12 @@ func sleep(ctx context.Context, d time.Duration) {
 	}
 }
 
-// Close releases the database connections
+// Close closes the connections opened by Dial. Pools passed to Load or New are
+// left open for you to close.
 func (q *Queues) Close() error {
-	q.pool.Close()
+	if q.closePool {
+		q.pool.Close()
+	}
 	return nil
 }
 

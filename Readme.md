@@ -134,6 +134,8 @@ Every backend has the same API. Switching changes the import and `Dial`:
 | `jetq`  | `jetq.Dial(ctx, log, "nats://localhost:4222")`                       | Creates the `JOBQ` and `JOBQ_DEAD` streams and a consumer per queue.  |
 | `sqs`   | `sqs.Dial(ctx, log, "https://sqs.<region>.amazonaws.com/<account>")` | Queues and dead-letter queues must already exist.                     |
 
+To share your app's `*pgxpool.Pool`, e.g. to push jobs in your own transactions, use `pgq.Load(ctx, log, pool)`. `queues.Close` leaves that pool open. To create `pgq_jobs` alongside your own migrations instead, use `pgq.New(log, pool)` and call `queues.Migrate(ctx)`.
+
 ## API Reference
 
 | Method                            | Description                                                    |
@@ -157,7 +159,7 @@ Jobs are delivered **at least once**, so make handlers idempotent. Returning an 
 
 ### Backend notes
 
-- **PostgreSQL:** completed jobs stay in `pgq_jobs`, so delete them periodically. `LISTEN` uses one extra connection per process running workers, which must be direct or session-pooled (PgBouncer's transaction pooling doesn't support it).
+- **PostgreSQL:** completed jobs stay in `pgq_jobs`, so delete them periodically. `Start` opens one extra connection for `LISTEN`, outside the pool and its `MaxConns`. It must be direct or session-pooled (PgBouncer's transaction pooling doesn't support it).
 - **SQLite:** other processes find new jobs by polling every 500ms. Don't put the file on a network filesystem.
 - **NATS JetStream:** queue names are dot-separated tokens. A delivery interrupted by a shutdown or crash counts as an attempt. Delayed jobs need NATS server 2.12+.
 - **SQS:** queue names may only use letters, numbers, hyphens and underscores. Delays are limited to 15 minutes. Each queue needs a dead-letter queue and permissions; see [docs/sqs.md](docs/sqs.md) for Terraform that sets them up.
