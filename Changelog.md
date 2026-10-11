@@ -1,3 +1,15 @@
+# 0.1.0 / 2026-10-10
+
+- add: `pgq.Load(ctx, log, pool)` to run on your app's `*pgxpool.Pool`. `Close` leaves the pool open.
+
+  ```go
+  pool, err := pgxpool.New(ctx, url)
+  defer pool.Close()
+  queues, err := pgq.Load(ctx, log, pool)
+  ```
+
+- add: `pgq.New(log, pool)` and `queues.Migrate(ctx)` to create `pgq_jobs` alongside your own migrations
+
 # 0.0.5 / 2026-10-04
 
 - add delayed jobs with PushIn and PushAt
